@@ -2358,7 +2358,6 @@ def _render_worker(args):
     img_b = capture_polygon_image_fast(snap_lat, snap_lon, ps, api_key, zoom=18)
     return mk_index, img_b
 
-
 def export_excel(markers: List[KMLMarker], all_polys: List[GenPoly],
                  headings: Dict, spec: PolySpec,
                  out_path: str, progress_cb=None) -> None:
