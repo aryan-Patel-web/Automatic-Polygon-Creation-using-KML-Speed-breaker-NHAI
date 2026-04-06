@@ -1,1005 +1,655 @@
-# """
-# polygon.py  v7  —  Speed Breaker CAP PTBM Polygon Engine
-# IIIT Nagpur | Under Dr. Neha Kasture | PWD / NHAI Road Safety Automation
-
-# FEATURES:
-#   ● Per-marker configuration: each marker can have its own:
-#       - num_lanes   (1=town-village, 2=city-town, 4=city-city)
-#       - road_width_m
-#       - separator_width_m
-#       - heading_deg
-#   ● 3-tier heading detection: per-marker → global → OSM → PCA → neighbour
-#   ● Lane-aware strip placement with symmetric separator gap
-#   ● Parallel strip guarantee: all strips at one marker share exact heading
-#   ● Curvature detection via bearing-delta analysis
-#   ● KML export with per-lane colour styles + curve pin highlighting
-#   ● Excel BOQ: 5 sheets — Annexure1, Heading Assignments, Marker Details,
-#                             Strip Coordinates, Project Spec
-
-# GEOMETRY (per MoRTH/NHAI CAP PTBM specification):
-#   strip LENGTH  = lane_width  (across road, perpendicular to heading)
-#   strip WIDTH   = strip_mm    (along road, thin dimension 10/15mm)
-#   strips stacked ALONG road, centred at marker
-#   all strips at same marker → identical heading → perfectly parallel
-# """
-
-# import math
-# import json
-# import xml.etree.ElementTree as ET
-# from dataclasses import dataclass, field
-# from typing import List, Tuple, Optional, Dict, Any
-# import urllib.request
-# import urllib.parse
-# import openpyxl
-# from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-# from openpyxl.utils import get_column_letter
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # CONSTANTS
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# R_EARTH = 6_371_000.0
-
-# LANE_PRESETS = {
-#     1: {"label": "1-Lane (Town→Village)", "road_width": 3.5,  "separator": 0.0, "has_sep": False},
-#     2: {"label": "2-Lane (City→Town)",    "road_width": 7.0,  "separator": 0.5, "has_sep": True},
-#     4: {"label": "4-Lane (City→City)",    "road_width": 14.0, "separator": 2.0, "has_sep": True},
-#     6: {"label": "6-Lane (Highway)",      "road_width": 21.0, "separator": 3.0, "has_sep": True},
-# }
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # DATA CLASSES
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# @dataclass
-# class MarkerInfo:
-#     """One KML point placemark."""
-#     index: int
-#     name: str
-#     lat: float
-#     lon: float
-#     description: str = ""
-#     placement_code: str = ""
-
-
-# @dataclass
-# class MarkerOverride:
-#     """
-#     Per-marker configuration that overrides the global PolygonSpec.
-#     Any field set to None means "use global spec value".
-#     """
-#     heading_deg: Optional[float]       = None   # road heading 0-179°
-#     num_lanes: Optional[int]           = None   # 1, 2, 4, 6
-#     road_width_m: Optional[float]      = None   # total road width
-#     separator_width_m: Optional[float] = None   # centre divider width
-#     has_separator: Optional[bool]      = None
-#     lane_gap_m: Optional[float]        = None   # extra gap between lane groups
-#     strip_length_m: Optional[float]    = None   # strip length override
-
-
-# @dataclass
-# class PolygonSpec:
-#     """
-#     Global defaults for all markers.
-#     Per-marker overrides in MarkerOverride take precedence.
-#     """
-#     # Strip dimensions
-#     strip_width_mm: float           = 15.0
-#     num_strips: int                 = 6
-#     gap_between_strips_m: float     = 0.10
-#     strip_length_override_m: float  = -1.0    # -1 = auto (= lane_width)
-
-#     # Road defaults (used when no per-marker override)
-#     num_lanes: int                  = 2
-#     road_width_m: float             = 7.0
-#     separator_width_m: float        = 0.5
-#     has_separator: bool             = True
-#     lane_gap_m: float               = -1.0    # -1 = auto
-
-#     # Heading
-#     heading_override: float         = -1.0    # global; -1 = auto-detect
-
-#     def effective_lane_gap(self, lane_w: float, sep_w: float) -> float:
-#         """Total clear zone between lane groups (separator + clearance)."""
-#         if self.lane_gap_m > 0:
-#             return self.lane_gap_m
-#         return sep_w + max(0.3, lane_w * 0.10)
-
-#     def resolve(self, override: Optional[MarkerOverride]) -> Dict[str, Any]:
-#         """
-#         Merge global spec with per-marker override.
-#         Returns a dict with resolved values for this specific marker.
-#         """
-#         if override is None:
-#             override = MarkerOverride()
-#         nl       = override.num_lanes       if override.num_lanes       is not None else self.num_lanes
-#         rw       = override.road_width_m    if override.road_width_m    is not None else self.road_width_m
-#         sw       = override.separator_width_m if override.separator_width_m is not None else self.separator_width_m
-#         hs       = override.has_separator   if override.has_separator   is not None else self.has_separator
-#         lg       = override.lane_gap_m      if override.lane_gap_m      is not None else self.lane_gap_m
-#         sl       = override.strip_length_m  if override.strip_length_m  is not None else self.strip_length_override_m
-#         drv      = rw - (sw if hs and nl > 1 else 0.0)
-#         lw       = drv / max(1, nl)
-#         eff_gap  = (sw + max(0.3, lw * 0.10)) if (hs and nl > 1 and lg <= 0) else max(lg, 0.0)
-#         return {
-#             "num_lanes": nl,
-#             "road_width_m": rw,
-#             "separator_width_m": sw,
-#             "has_separator": hs,
-#             "lane_gap_m": eff_gap,
-#             "lane_width_m": lw,
-#             "strip_length_m": sl if sl > 0 else lw,
-#         }
-
-
-# @dataclass
-# class GeneratedPolygon:
-#     marker: MarkerInfo
-#     coordinates: List[Tuple[float, float]]           # bounding hull (lon, lat)
-#     heading_deg: float
-#     road_curvature: str
-#     strip_polygons: List[List[Tuple[float, float]]]  # per-strip closed rings
-#     lane_assignments: List[int]
-#     heading_source: str = "auto"
-#     num_lanes_used: int = 2
-#     spec: PolygonSpec = field(default_factory=PolygonSpec)
-#     override: Optional[MarkerOverride] = None
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # KML PARSING
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def parse_kml_markers(kml_path: str) -> List[MarkerInfo]:
-#     """Parse all Point Placemarks from a KML file."""
-#     tree = ET.parse(kml_path)
-#     root = tree.getroot()
-#     markers, idx = [], 1
-#     for pm in root.iter():
-#         if pm.tag.split('}')[-1] != 'Placemark':
-#             continue
-#         ne = _ch(pm, 'name')
-#         de = _ch(pm, 'description')
-#         name = (ne.text or '').strip() if ne is not None else f"Marker_{idx}"
-#         desc = (de.text or '').strip() if de is not None else ""
-#         coord = _extract_point(pm)
-#         if coord is None:
-#             continue
-#         lon, lat = coord
-#         code = name if any(k in name.upper()
-#                            for k in ['CAP','PTBM','MM','FM','SIGN','GO SLOW']) else ""
-#         markers.append(MarkerInfo(idx, name, lat, lon, desc, code))
-#         idx += 1
-#     return markers
-
-
-# def _ch(el, tag):
-#     for c in el:
-#         if c.tag.split('}')[-1] == tag:
-#             return c
-#     return None
-
-
-# def _extract_point(pm) -> Optional[Tuple[float, float]]:
-#     for el in pm.iter():
-#         if el.tag.split('}')[-1] == 'coordinates' and el.text:
-#             p = el.text.strip().split(',')
-#             if len(p) >= 2:
-#                 try:
-#                     return float(p[0]), float(p[1])
-#                 except ValueError:
-#                     pass
-#     return None
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # GEODESIC MATHEMATICS
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-#     """Great-circle distance in metres."""
-#     φ1, φ2 = math.radians(lat1), math.radians(lat2)
-#     a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2 +
-#          math.cos(φ1) * math.cos(φ2) *
-#          math.sin(math.radians(lon2 - lon1) / 2) ** 2)
-#     return 2 * R_EARTH * math.asin(math.sqrt(max(0.0, min(1.0, a))))
-
-
-# def forward_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-#     """Forward azimuth [0, 360)."""
-#     φ1, φ2 = math.radians(lat1), math.radians(lat2)
-#     dλ = math.radians(lon2 - lon1)
-#     x = math.sin(dλ) * math.cos(φ2)
-#     y = math.cos(φ1) * math.sin(φ2) - math.sin(φ1) * math.cos(φ2) * math.cos(dλ)
-#     return (math.degrees(math.atan2(x, y)) + 360) % 360
-
-
-# def offset_point(lat: float, lon: float, dist_m: float, hdg_deg: float) -> Tuple[float, float]:
-#     """Move (lat, lon) by dist_m in direction hdg_deg. Returns (lat, lon)."""
-#     if dist_m == 0:
-#         return lat, lon
-#     d = dist_m / R_EARTH
-#     h = math.radians(hdg_deg)
-#     φ1 = math.radians(lat)
-#     λ1 = math.radians(lon)
-#     φ2 = math.asin(math.sin(φ1) * math.cos(d) +
-#                    math.cos(φ1) * math.sin(d) * math.cos(h))
-#     λ2 = λ1 + math.atan2(math.sin(h) * math.sin(d) * math.cos(φ1),
-#                           math.cos(d) - math.sin(φ1) * math.sin(φ2))
-#     return math.degrees(φ2), math.degrees(λ2)
-
-
-# def normalise_heading(h: float) -> float:
-#     """Reduce heading to [0, 180) — road is bidirectional."""
-#     h = h % 360
-#     return h - 180 if h >= 180 else h
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # HEADING DETECTION  (3-tier fallback)
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def _osm_road_heading(lat: float, lon: float, radius_m: int = 40) -> Optional[float]:
-#     """
-#     Query OpenStreetMap Overpass API for nearest highway segment.
-#     Returns road heading [0, 180) or None on failure/timeout.
-#     """
-#     query = (f'[out:json][timeout:8];'
-#              f'way(around:{radius_m},{lat:.6f},{lon:.6f})[highway];out geom 8;')
-#     try:
-#         data = urllib.parse.urlencode({'data': query}).encode()
-#         req  = urllib.request.Request('https://overpass-api.de/api/interpreter', data)
-#         req.add_header('User-Agent', 'GIS-BOQ-Tool-v7')
-#         with urllib.request.urlopen(req, timeout=8) as r:
-#             ways = json.loads(r.read().decode()).get('elements', [])
-#         best_h, best_d = None, 1e9
-#         for way in ways:
-#             geom = way.get('geometry', [])
-#             for i in range(len(geom) - 1):
-#                 n1, n2 = geom[i], geom[i + 1]
-#                 ml = (n1['lat'] + n2['lat']) / 2
-#                 mo = (n1['lon'] + n2['lon']) / 2
-#                 d  = haversine_distance(lat, lon, ml, mo)
-#                 if d < best_d:
-#                     best_d = d
-#                     b = forward_bearing(n1['lat'], n1['lon'], n2['lat'], n2['lon'])
-#                     best_h = normalise_heading(b)
-#         return best_h
-#     except Exception:
-#         return None
-
-
-# _osm_cache: Dict[Tuple[float, float], Optional[float]] = {}
-
-# def _osm_cached(lat: float, lon: float) -> Optional[float]:
-#     key = (round(lat, 4), round(lon, 4))
-#     if key not in _osm_cache:
-#         _osm_cache[key] = _osm_road_heading(lat, lon)
-#     return _osm_cache[key]
-
-
-# def pca_heading(markers: List[MarkerInfo]) -> Optional[float]:
-#     """
-#     Principal Component Analysis on all marker positions.
-#     Returns dominant road direction [0, 180) if spread > 10m, else None.
-#     """
-#     if len(markers) < 2:
-#         return None
-#     lats = [m.lat for m in markers]
-#     lons = [m.lon for m in markers]
-#     clat = sum(lats) / len(lats)
-#     clon = sum(lons) / len(lons)
-#     slat = 111_320.0
-#     slon = 111_320.0 * math.cos(math.radians(clat))
-#     ys = [(la - clat) * slat for la in lats]
-#     xs = [(lo - clon) * slon for lo in lons]
-#     spread = math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2)
-#     if spread < 10.0:
-#         return None
-#     n  = len(xs)
-#     mx = sum(xs) / n
-#     my = sum(ys) / n
-#     cxx = sum((x - mx) ** 2 for x in xs) / n
-#     cxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / n
-#     cyy = sum((y - my) ** 2 for y in ys) / n
-#     tr   = cxx + cyy
-#     det  = cxx * cyy - cxy ** 2
-#     disc = math.sqrt(max(0.0, (tr / 2) ** 2 - det))
-#     lam  = tr / 2 + disc
-#     if abs(cxy) > 1e-12:
-#         vx, vy = lam - cyy, cxy
-#     elif cxx >= cyy:
-#         vx, vy = 1.0, 0.0
-#     else:
-#         vx, vy = 0.0, 1.0
-#     return normalise_heading((math.degrees(math.atan2(vx, vy)) + 360) % 360)
-
-
-# def _neighbour_bearing(markers: List[MarkerInfo], idx: int) -> float:
-#     """
-#     Weighted circular mean of road bearings from ±3 neighbours.
-#     Normalised to [0, 180) before averaging to prevent reversal bug.
-#     """
-#     n = len(markers)
-#     cur = markers[idx]
-#     ws = wc = tw = 0.0
-#     for off in range(-3, 4):
-#         if off == 0:
-#             continue
-#         j = idx + off
-#         if not 0 <= j < n:
-#             continue
-#         nb = markers[j]
-#         b  = forward_bearing(nb.lat, nb.lon, cur.lat, cur.lon) if off < 0 \
-#              else forward_bearing(cur.lat, cur.lon, nb.lat, nb.lon)
-#         nm = normalise_heading(b)
-#         w  = 1.0 / abs(off)
-#         ws += w * math.sin(math.radians(nm))
-#         wc += w * math.cos(math.radians(nm))
-#         tw += w
-#     if tw == 0:
-#         return 0.0
-#     return (math.degrees(math.atan2(ws / tw, wc / tw)) + 360) % 360
-
-
-# def resolve_heading(
-#     markers: List[MarkerInfo],
-#     idx: int,
-#     spec: PolygonSpec,
-#     pca_h: Optional[float],
-#     use_osm: bool,
-#     per_marker_headings: Dict[int, float],
-# ) -> Tuple[float, str]:
-#     """
-#     Heading priority:
-#       1. per_marker_headings[marker_index]  → "per-marker"
-#       2. spec.heading_override              → "global"
-#       3. OSM Overpass API                   → "osm"
-#       4. PCA of all markers                 → "pca"
-#       5. Neighbour bearing average          → "neighbour"
-#     Returns (heading [0,180), source_label).
-#     """
-#     mk_idx = markers[idx].index
-#     if mk_idx in per_marker_headings:
-#         return normalise_heading(per_marker_headings[mk_idx]), "per-marker"
-#     if 0 <= spec.heading_override < 180:
-#         return float(spec.heading_override), "global"
-#     if use_osm:
-#         h = _osm_cached(markers[idx].lat, markers[idx].lon)
-#         if h is not None:
-#             return h, "osm"
-#     if pca_h is not None:
-#         return pca_h, "pca"
-#     return _neighbour_bearing(markers, idx), "neighbour"
-
-
-# def detect_curvature(markers: List[MarkerInfo], idx: int) -> str:
-#     """Classify road curvature at marker from bearing-delta of neighbours."""
-#     n = len(markers)
-#     if idx == 0 or idx >= n - 1:
-#         return "straight"
-#     b_in  = forward_bearing(markers[idx-1].lat, markers[idx-1].lon,
-#                              markers[idx].lat,   markers[idx].lon)
-#     b_out = forward_bearing(markers[idx].lat,    markers[idx].lon,
-#                              markers[idx+1].lat,  markers[idx+1].lon)
-#     delta = abs(normalise_heading(b_in) - normalise_heading(b_out))
-#     delta = min(delta, 180 - delta)
-#     if delta < 5:   return "straight"
-#     if delta < 20:  return "slight_curve"
-#     return "sharp_curve"
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # STRIP RECTANGLE BUILDER
-# # ═══════════════════════════════════════════════════════════════════════════════
-# #
-# #  Road  ──────────────────────────────────────────────► heading H
-# #
-# #  ←lane_w→  ←─ sep ─→  ←lane_w→
-# #  ┌────────┐            ┌────────┐
-# #  │════════│            │════════│  strip 1 & (n/2+1)
-# #  │════════│            │════════│  strip 2 & (n/2+2)
-# #  │════════│            │════════│  strip 3 & (n/2+3)
-# #  └────────┘            └────────┘
-# #
-# #  Each ═══ rectangle:
-# #    long side  = strip_length_m  (across road, ⊥ to H)
-# #    short side = strip_width_mm  (along road, ∥ to H)
-# #
-# #  pa, pb  = signed perpendicular extents from road centre
-# #            (+ve = left of heading,  −ve = right of heading)
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def make_strip(
-#     mk_lat:   float,
-#     mk_lon:   float,
-#     hdg:      float,    # road heading [0, 360)
-#     along_m:  float,    # strip centre offset along road from marker
-#     sw_m:     float,    # strip width (thin dim, e.g. 0.015)
-#     pa:       float,    # near perpendicular edge (signed metres)
-#     pb:       float,    # far  perpendicular edge (signed metres)
-# ) -> List[Tuple[float, float]]:
-#     """
-#     Build one strip rectangle. Returns closed ring [(lon, lat), ...] — 5 pts.
-#     """
-#     h_fwd  = hdg
-#     h_bwd  = (hdg + 180) % 360
-#     h_left = (hdg - 90 + 360) % 360
-#     h_rgt  = (hdg + 90) % 360
-#     half   = sw_m / 2.0
-
-#     sc_lat, sc_lon = offset_point(mk_lat, mk_lon, along_m, h_fwd)
-#     fe_lat, fe_lon = offset_point(sc_lat, sc_lon, half, h_fwd)
-#     be_lat, be_lon = offset_point(sc_lat, sc_lon, half, h_bwd)
-
-#     def gp(lat, lon, d):
-#         return offset_point(lat, lon,  d, h_left) if d >= 0 \
-#                else offset_point(lat, lon, -d, h_rgt)
-
-#     fn = gp(fe_lat, fe_lon, pa)
-#     ff = gp(fe_lat, fe_lon, pb)
-#     bf = gp(be_lat, be_lon, pb)
-#     bn = gp(be_lat, be_lon, pa)
-#     ring = [(fn[1], fn[0]), (ff[1], ff[0]), (bf[1], bf[0]), (bn[1], bn[0])]
-#     ring.append(ring[0])
-#     return ring
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # MAIN POLYGON GENERATOR
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def generate_polygon_for_marker(
-#     markers:              List[MarkerInfo],
-#     idx:                  int,
-#     spec:                 PolygonSpec,
-#     pca_h:                Optional[float],
-#     use_osm:              bool,
-#     per_marker_headings:  Dict[int, float],
-#     per_marker_overrides: Dict[int, MarkerOverride],
-# ) -> GeneratedPolygon:
-#     """
-#     Build all speed breaker strips at one marker.
-
-#     Uses per-marker overrides (lanes, road width, separator, heading)
-#     if provided, otherwise falls back to global PolygonSpec values.
-
-#     Cross-section (2-lane example, 6 strips = 3 per lane):
-#       [L1-S1][L1-S2][L1-S3]  ← SEP →  [L2-S4][L2-S5][L2-S6]
-#       All strips have SAME heading → guaranteed perfectly parallel.
-#     """
-#     cur  = markers[idx]
-#     mk_i = cur.index
-
-#     # Resolve heading
-#     hdg, src = resolve_heading(markers, idx, spec, pca_h, use_osm, per_marker_headings)
-#     curv = detect_curvature(markers, idx)
-
-#     # Resolve per-marker road config
-#     ov   = per_marker_overrides.get(mk_i)
-#     cfg  = spec.resolve(ov)
-
-#     sw_m      = spec.strip_width_mm / 1000.0
-#     gap_m     = spec.gap_between_strips_m
-#     nl        = max(1, cfg["num_lanes"])
-#     lane_w    = cfg["lane_width_m"]
-#     strip_len = cfg["strip_length_m"]
-#     half_gap  = cfg["lane_gap_m"] / 2.0 if (cfg["has_separator"] and nl > 1) else 0.0
-#     half_road = cfg["road_width_m"] / 2.0
-
-#     # Distribute strips evenly across lanes
-#     base = spec.num_strips // nl
-#     rem  = spec.num_strips % nl
-#     spl  = [base + (1 if i < rem else 0) for i in range(nl)]
-
-#     # Along-road positions: use per-lane count (NOT global count)
-#     max_spl      = max(spl)
-#     total_along  = max_spl * sw_m + (max_spl - 1) * gap_m
-#     start_along  = -total_along / 2.0
-
-#     strips: List[List[Tuple[float, float]]] = []
-#     lanes:  List[int]                        = []
-
-#     for lane_idx in range(nl):
-#         n_in = spl[lane_idx]
-#         if n_in == 0:
-#             continue
-
-#         # ── Perpendicular extents of this lane ────────────────────────────
-#         if nl == 1:
-#             pa, pb = -strip_len / 2.0, strip_len / 2.0
-
-#         elif lane_idx % 2 == 0:
-#             # Left-side lanes (+perp direction)
-#             tier        = lane_idx // 2
-#             inner_edge  = half_gap + tier * lane_w
-#             lane_centre = inner_edge + lane_w / 2.0
-#             pa = lane_centre - strip_len / 2.0
-#             pb = lane_centre + strip_len / 2.0
-
-#         else:
-#             # Right-side lanes (−perp direction)
-#             tier        = lane_idx // 2
-#             inner_edge  = half_gap + tier * lane_w
-#             lane_centre = -(inner_edge + lane_w / 2.0)
-#             pa = lane_centre + strip_len / 2.0
-#             pb = lane_centre - strip_len / 2.0
-
-#         # Build strips with LOCAL s_idx so all lanes align along road
-#         for s_idx in range(n_in):
-#             along = start_along + s_idx * (sw_m + gap_m) + sw_m / 2.0
-#             strips.append(make_strip(cur.lat, cur.lon, hdg, along, sw_m, pa, pb))
-#             lanes.append(lane_idx + 1)
-
-#     all_pts = [pt for s in strips for pt in s]
-#     bnd     = convex_hull(all_pts) if len(all_pts) >= 3 else all_pts
-
-#     return GeneratedPolygon(
-#         marker=cur,
-#         coordinates=bnd,
-#         heading_deg=hdg,
-#         road_curvature=curv,
-#         strip_polygons=strips,
-#         lane_assignments=lanes,
-#         heading_source=src,
-#         num_lanes_used=nl,
-#         spec=spec,
-#         override=ov,
-#     )
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # CONVEX HULL  (Graham scan)
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def convex_hull(pts: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-#     pts = sorted(set(pts))
-#     if len(pts) <= 2:
-#         return pts + ([pts[0]] if pts else [])
-#     def cross(O, A, B):
-#         return (A[0]-O[0])*(B[1]-O[1]) - (A[1]-O[1])*(B[0]-O[0])
-#     lo, up = [], []
-#     for p in pts:
-#         while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0: lo.pop()
-#         lo.append(p)
-#     for p in reversed(pts):
-#         while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0: up.pop()
-#         up.append(p)
-#     h = lo[:-1] + up[:-1]
-#     return h + [h[0]] if h else h
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # KML EXPORT
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# _KML_STYLES = """
-#   <Style id="sL1">
-#     <LineStyle><color>ff00d7ff</color><width>1</width></LineStyle>
-#     <PolyStyle><color>d000d7ff</color></PolyStyle>
-#   </Style>
-#   <Style id="sL2">
-#     <LineStyle><color>ff0088ff</color><width>1</width></LineStyle>
-#     <PolyStyle><color>d00088ff</color></PolyStyle>
-#   </Style>
-#   <Style id="sL3">
-#     <LineStyle><color>ff00ff88</color><width>1</width></LineStyle>
-#     <PolyStyle><color>d000ff88</color></PolyStyle>
-#   </Style>
-#   <Style id="sL4">
-#     <LineStyle><color>ff8800ff</color><width>1</width></LineStyle>
-#     <PolyStyle><color>d08800ff</color></PolyStyle>
-#   </Style>
-#   <Style id="bnd">
-#     <LineStyle><color>ff0000ff</color><width>2</width></LineStyle>
-#     <PolyStyle><color>110000ff</color></PolyStyle>
-#   </Style>
-#   <Style id="pin">
-#     <IconStyle>
-#       <color>ff00d7ff</color><scale>1.1</scale>
-#       <Icon><href>http://maps.google.com/mapfiles/kml/paddle/ylw-circle.png</href></Icon>
-#     </IconStyle>
-#     <LabelStyle><color>ffffffff</color><scale>0.85</scale></LabelStyle>
-#   </Style>
-#   <Style id="pinCurve">
-#     <IconStyle>
-#       <color>ff0000ff</color><scale>1.2</scale>
-#       <Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon>
-#     </IconStyle>
-#     <LabelStyle><color>ffffffff</color><scale>0.85</scale></LabelStyle>
-#   </Style>
-#   <Style id="pinOverride">
-#     <IconStyle>
-#       <color>ff0088ff</color><scale>1.15</scale>
-#       <Icon><href>http://maps.google.com/mapfiles/kml/paddle/orange-circle.png</href></Icon>
-#     </IconStyle>
-#     <LabelStyle><color>ffffffff</color><scale>0.85</scale></LabelStyle>
-#   </Style>
-# """
-
-
-# def _cs(coords, alt=0):
-#     return " ".join(f"{lo},{la},{alt}" for lo, la in coords)
-
-
-# def export_kml(
-#     markers:              List[MarkerInfo],
-#     polygons:             List[GeneratedPolygon],
-#     out_path:             str,
-#     spec:                 PolygonSpec,
-#     per_marker_headings:  Dict[int, float] = None,
-#     per_marker_overrides: Dict[int, MarkerOverride] = None,
-# ):
-#     per_marker_headings  = per_marker_headings  or {}
-#     per_marker_overrides = per_marker_overrides or {}
-#     lane_styles = ["#sL1", "#sL2", "#sL3", "#sL4"]
-
-#     lines = [
-#         '<?xml version="1.0" encoding="UTF-8"?>',
-#         '<kml xmlns="http://www.opengis.net/kml/2.2">',
-#         '<Document>',
-#         '  <n>CAP PTBM Speed Breaker Polygons v7</n>',
-#         '  <description>GIS BOQ Tool — IIIT Nagpur | PWD/NHAI</description>',
-#         _KML_STYLES,
-#     ]
-
-#     for pg in polygons:
-#         mk  = pg.marker
-#         ov  = per_marker_overrides.get(mk.index)
-#         has_hdg_ov  = mk.index in per_marker_headings
-#         has_lane_ov = ov is not None and ov.num_lanes is not None
-#         pin_style   = ("#pinCurve"   if has_hdg_ov  else
-#                        "#pinOverride" if has_lane_ov else "#pin")
-
-#         nl  = pg.num_lanes_used
-#         cfg = spec.resolve(ov)
-#         lw  = cfg["lane_width_m"]
-#         sep = f"{cfg['separator_width_m']:.1f}m" if cfg['has_separator'] and nl > 1 else "none"
-
-#         info = (
-#             f"<b>{mk.placement_code or mk.name}</b><br/>"
-#             f"{'🔶 PER-MARKER OVERRIDE<br/>' if (has_hdg_ov or has_lane_ov) else ''}"
-#             f"Heading: <b>{pg.heading_deg:.1f}°</b> [{pg.heading_source}]<br/>"
-#             f"Lanes: <b>{nl}</b> ({LANE_PRESETS.get(nl, {}).get('label', '')})<br/>"
-#             f"Road: {pg.road_curvature.replace('_', ' ').title()}<br/>"
-#             f"Strip: {spec.strip_width_mm}mm × {lw:.2f}m | Sep: {sep}<br/>"
-#             f"Total strips: {len(pg.strip_polygons)} | "
-#             f"Coords: {mk.lat:.6f}, {mk.lon:.6f}"
-#         )
-
-#         lines += [
-#             f'  <Folder>',
-#             f'    <n>{mk.name}</n>',
-#             '    <Placemark>',
-#             f'      <n>{mk.name}</n>',
-#             f'      <styleUrl>{pin_style}</styleUrl>',
-#             f'      <description><![CDATA[{info}]]></description>',
-#             f'      <Point><coordinates>{mk.lon},{mk.lat},0</coordinates></Point>',
-#             '    </Placemark>',
-#         ]
-
-#         if len(pg.coordinates) >= 3:
-#             lines += [
-#                 '    <Placemark>',
-#                 f'      <n>{mk.name} – Bounding</n>',
-#                 '      <styleUrl>#bnd</styleUrl>',
-#                 '      <Polygon><tessellate>1</tessellate>',
-#                 '        <outerBoundaryIs><LinearRing>',
-#                 f'          <coordinates>{_cs(pg.coordinates)}</coordinates>',
-#                 '        </LinearRing></outerBoundaryIs></Polygon>',
-#                 '    </Placemark>',
-#             ]
-
-#         for i, (strip, ln) in enumerate(
-#                 zip(pg.strip_polygons, pg.lane_assignments), 1):
-#             st = lane_styles[(ln - 1) % len(lane_styles)]
-#             lines += [
-#                 '    <Placemark>',
-#                 f'      <n>{mk.name} L{ln}S{i}</n>',
-#                 f'      <styleUrl>{st}</styleUrl>',
-#                 f'      <description><![CDATA['
-#                 f'Strip {i} | Lane {ln} | {spec.strip_width_mm}mm × {lw:.2f}m | '
-#                 f'Hdg:{pg.heading_deg:.1f}°[{pg.heading_source}]'
-#                 f']]></description>',
-#                 '      <Polygon><tessellate>1</tessellate>',
-#                 '        <outerBoundaryIs><LinearRing>',
-#                 f'          <coordinates>{_cs(strip)}</coordinates>',
-#                 '        </LinearRing></outerBoundaryIs></Polygon>',
-#                 '    </Placemark>',
-#             ]
-
-#         lines.append('  </Folder>')
-
-#     lines += ['</Document>', '</kml>']
-#     with open(out_path, 'w', encoding='utf-8') as f:
-#         f.write('\n'.join(lines))
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # EXCEL BOQ EXPORT
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def export_excel(
-#     polygons:             List[GeneratedPolygon],
-#     out_path:             str,
-#     spec:                 PolygonSpec,
-#     per_marker_headings:  Dict[int, float] = None,
-#     per_marker_overrides: Dict[int, MarkerOverride] = None,
-# ):
-#     per_marker_headings  = per_marker_headings  or {}
-#     per_marker_overrides = per_marker_overrides or {}
-
-#     wb   = openpyxl.Workbook()
-#     HF   = PatternFill("solid", start_color="1F3864", end_color="1F3864")
-#     YF   = PatternFill("solid", start_color="FFD700", end_color="FFD700")
-#     OF   = PatternFill("solid", start_color="FFA500", end_color="FFA500")
-#     AF   = PatternFill("solid", start_color="EBF5FB", end_color="EBF5FB")
-#     WF   = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
-#     BLF  = PatternFill("solid", start_color="D6EAF8", end_color="D6EAF8")
-#     GRF  = PatternFill("solid", start_color="E2EFDA", end_color="E2EFDA")
-#     T    = Border(left=Side(style='thin'), right=Side(style='thin'),
-#                   top=Side(style='thin'),  bottom=Side(style='thin'))
-#     CC   = Alignment(horizontal='center', vertical='center', wrap_text=True)
-#     LC   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
-
-#     def hc(ws, r, c, v, fill=None):
-#         cell = ws.cell(row=r, column=c, value=v)
-#         cell.font = Font(bold=True, size=9, color="FFFFFF")
-#         cell.fill = fill or HF
-#         cell.alignment = CC
-#         cell.border = T
-#         return cell
-
-#     def dc(ws, r, c, v, fill=None, al=None, bold=False, sz=9):
-#         cell = ws.cell(row=r, column=c, value=v)
-#         cell.font = Font(size=sz, bold=bold)
-#         cell.fill = fill or WF
-#         cell.alignment = al or CC
-#         cell.border = T
-#         return cell
-
-#     # ── Sheet 1: BOQ Annexure 1 ─────────────────────────────────────────────
-#     ws = wb.active
-#     ws.title = "BOQ Sheet 1"
-
-#     ws.merge_cells("A1:K1")
-#     ws['A1'].value = "ANNEXURE 1 - ESTIMATE"
-#     ws['A1'].font = Font(bold=True, size=14, color="FFFFFF")
-#     ws['A1'].fill = HF; ws['A1'].alignment = CC
-
-#     ws.merge_cells("A2:K2")
-#     ws['A2'].value = "Speed Breaker CAP PTBM Road Marking — Bill of Quantities"
-#     ws['A2'].font = Font(bold=True, size=11); ws['A2'].alignment = CC
-
-#     ws.merge_cells("A3:K3")
-#     ws['A3'].value = "GIS BOQ Tool v7 | IIIT Nagpur | Dr. Neha Kasture | PWD/NHAI"
-#     ws['A3'].font = Font(italic=True, size=9, color="555555"); ws['A3'].alignment = CC
-#     ws.row_dimensions[4].height = 4
-
-#     for ci, h in enumerate([
-#         "S.No.", "Description", "Code", "Nos.",
-#         "Length\n(m)", "Breadth\n(m)", "Area\n(Sqm)",
-#         "Total Qty\n(Sqm)", "Rate\n(Rs./Sqm)", "Amount\n(Rs.)",
-#         "Notes / Override"
-#     ], 1):
-#         hc(ws, 5, ci, h)
-#     ws.row_dimensions[5].height = 40
-
-#     ws.merge_cells("A6:K6")
-#     ws['A6'].value = (
-#         f"  Strip:{spec.strip_width_mm}mm | Strips:{spec.num_strips} | "
-#         f"Default: {spec.num_lanes}-lane/{spec.road_width_m}m | "
-#         f"Sep:{spec.separator_width_m}m | Gap:{spec.gap_between_strips_m}m"
-#     )
-#     ws['A6'].font = Font(bold=True, size=9, color="1F3864")
-#     ws['A6'].fill = BLF; ws['A6'].alignment = LC; ws['A6'].border = T
-
-#     swm = spec.strip_width_mm / 1000.0
-#     for ri, pg in enumerate(polygons, 1):
-#         mk  = pg.marker
-#         er  = ri + 6
-#         ov  = per_marker_overrides.get(mk.index)
-#         cfg = spec.resolve(ov)
-#         lw  = cfg["lane_width_m"]
-#         is_ov = (mk.index in per_marker_headings or ov is not None)
-#         fill  = OF if is_ov else (AF if ri % 2 == 0 else WF)
-
-#         a1 = swm * lw
-#         ta = a1 * spec.num_strips
-#         code = mk.placement_code or f"CAP PTBM {int(spec.strip_width_mm)}MM X {spec.num_strips}"
-#         desc = (f"Supply and Application of Single Rib Pattern Cold Applied Plastic (CAP) "
-#                 f"Parabolic Transverse Bar Rumble Marking (PTBM) — "
-#                 f"{int(spec.strip_width_mm)}mm Thk.")
-#         lane_lbl = LANE_PRESETS.get(pg.num_lanes_used, {}).get("label", f"{pg.num_lanes_used}-Lane")
-#         notes = (
-#             f"{pg.road_curvature.replace('_', ' ').title()} | "
-#             f"Hdg:{pg.heading_deg:.1f}°[{pg.heading_source}] | "
-#             f"{lane_lbl} | {mk.lat:.5f},{mk.lon:.5f}"
-#         )
-
-#         dc(ws, er, 1,  ri,     fill)
-#         dc(ws, er, 2,  desc,   fill, al=LC)
-#         dc(ws, er, 3,  code,   fill)
-#         dc(ws, er, 4,  1,      fill)
-#         dc(ws, er, 5,  round(cfg["road_width_m"], 2), fill)
-#         dc(ws, er, 6,  round(swm, 4),  fill)
-#         dc(ws, er, 7,  round(a1, 5),   fill)
-#         dc(ws, er, 8,  round(ta, 4),   fill)
-#         dc(ws, er, 9,  "",             fill)
-#         amt = ws.cell(row=er, column=10, value=f'=IF(I{er}="","",H{er}*I{er})')
-#         amt.fill = fill; amt.border = T; amt.alignment = CC; amt.font = Font(size=9)
-#         dc(ws, er, 11, notes, fill, al=LC)
-
-#     tr = len(polygons) + 7
-#     ws.merge_cells(f"A{tr}:G{tr}")
-#     for ci in range(1, 12):
-#         c = ws.cell(row=tr, column=ci)
-#         c.fill = YF; c.border = T
-#         c.font = Font(bold=True, size=10); c.alignment = CC
-#     ws[f"A{tr}"].value = "TOTAL"
-#     ws[f"H{tr}"].value = f"=SUM(H7:H{tr-1})"
-#     ws[f"J{tr}"].value = f"=SUM(J7:J{tr-1})"
-#     for ci, w in enumerate([6, 44, 20, 6, 12, 12, 12, 14, 14, 14, 38], 1):
-#         ws.column_dimensions[get_column_letter(ci)].width = w
-
-#     # ── Sheet 2: Heading & Lane Assignments ─────────────────────────────────
-#     ws2 = wb.create_sheet("Heading & Lane Assignments")
-#     for ci, h in enumerate([
-#         "Marker #", "Name", "Code", "Lat", "Lon",
-#         "Heading°", "Src", "Curvature",
-#         "Lanes Used", "Road Width", "Sep Width",
-#         "Heading Override?", "Lane Override?", "Notes"
-#     ], 1):
-#         hc(ws2, 1, ci, h)
-#     ws2.row_dimensions[1].height = 30
-
-#     for ri, pg in enumerate(polygons, 2):
-#         mk  = pg.marker
-#         ov  = per_marker_overrides.get(mk.index)
-#         cfg = spec.resolve(ov)
-#         fill = OF if (mk.index in per_marker_headings or ov is not None) else (AF if ri%2==0 else WF)
-#         hov  = str(per_marker_headings.get(mk.index, "—"))
-#         lov  = str(ov.num_lanes) if ov and ov.num_lanes else "—"
-#         lane_lbl = LANE_PRESETS.get(pg.num_lanes_used, {}).get("label", f"{pg.num_lanes_used}-Lane")
-#         for ci, v in enumerate([
-#             mk.index, mk.name, mk.placement_code or "—",
-#             round(mk.lat, 7), round(mk.lon, 7),
-#             round(pg.heading_deg, 2), pg.heading_source,
-#             pg.road_curvature.replace('_', ' ').title(),
-#             lane_lbl,
-#             round(cfg["road_width_m"], 2),
-#             round(cfg["separator_width_m"], 2),
-#             f"YES {hov}°" if mk.index in per_marker_headings else "no",
-#             f"YES {lov}-lane" if ov and ov.num_lanes else "no",
-#             "OVERRIDDEN" if (mk.index in per_marker_headings or ov) else "default",
-#         ], 1):
-#             dc(ws2, ri, ci, v, fill)
-#     for i in range(1, 15):
-#         ws2.column_dimensions[get_column_letter(i)].width = 16
-
-#     # ── Sheet 3: Marker Details ──────────────────────────────────────────────
-#     ws3 = wb.create_sheet("Marker Details")
-#     for ci, h in enumerate([
-#         "#", "Name", "Code", "Lat", "Lon", "Heading°", "Src",
-#         "Curvature", "Lanes", "Strips", "Per Lane",
-#         "Strip W(mm)", "Road W(m)", "Lane W(m)", "Area/Strip"
-#     ], 1):
-#         hc(ws3, 1, ci, h)
-#     for ri, pg in enumerate(polygons, 2):
-#         mk  = pg.marker
-#         ov  = per_marker_overrides.get(mk.index)
-#         cfg = spec.resolve(ov)
-#         fill = AF if ri % 2 == 0 else WF
-#         lw2  = cfg["lane_width_m"]
-#         for ci, v in enumerate([
-#             mk.index, mk.name, mk.placement_code or "—",
-#             round(mk.lat, 7), round(mk.lon, 7),
-#             round(pg.heading_deg, 2), pg.heading_source,
-#             pg.road_curvature.replace('_', ' ').title(),
-#             pg.num_lanes_used, spec.num_strips,
-#             spec.num_strips // pg.num_lanes_used,
-#             spec.strip_width_mm, cfg["road_width_m"],
-#             round(lw2, 3), round(spec.strip_width_mm / 1000 * lw2, 5),
-#         ], 1):
-#             dc(ws3, ri, ci, v, fill)
-#     for i in range(1, 16):
-#         ws3.column_dimensions[get_column_letter(i)].width = 16
-
-#     # ── Sheet 4: Strip Coordinates ───────────────────────────────────────────
-#     ws4 = wb.create_sheet("Strip Coordinates")
-#     for ci, h in enumerate(["Marker#", "Name", "Lane", "Strip", "Corner", "Lon", "Lat"], 1):
-#         hc(ws4, 1, ci, h)
-#     r = 2
-#     for pg in polygons:
-#         for si, (strip, ln) in enumerate(zip(pg.strip_polygons, pg.lane_assignments), 1):
-#             fill = AF if si % 2 == 0 else WF
-#             for ci2, (lo, la) in enumerate(strip, 1):
-#                 for ci3, v in enumerate([
-#                     pg.marker.index, pg.marker.name,
-#                     ln, si, ci2, round(lo, 8), round(la, 8)
-#                 ], 1):
-#                     dc(ws4, r, ci3, v, fill)
-#                 r += 1
-#     for i in range(1, 8):
-#         ws4.column_dimensions[get_column_letter(i)].width = 20
-
-#     # ── Sheet 5: Project Spec ────────────────────────────────────────────────
-#     ws5 = wb.create_sheet("Project Spec")
-#     ws5.merge_cells("A1:B1")
-#     ws5['A1'].value = "Project Specification — Speed Breaker Installation"
-#     ws5['A1'].font = Font(bold=True, size=11, color="FFFFFF")
-#     ws5['A1'].fill = HF; ws5['A1'].alignment = CC; ws5['A1'].border = T
-
-#     ov_count = sum(1 for pg in polygons if pg.heading_source == "per-marker")
-#     lc_count = sum(1 for pg in polygons if pg.override and pg.override.num_lanes)
-#     rows = [
-#         ("Material",               "Cold Applied Plastic (CAP) PTBM — Parabolic Transverse Bar"),
-#         ("Strip Width",            f"{spec.strip_width_mm} mm"),
-#         ("Number of Strips",       str(spec.num_strips)),
-#         ("Gap Between Strips",     f"{spec.gap_between_strips_m} m"),
-#         ("Default Lanes",          f"{spec.num_lanes}"),
-#         ("Default Road Width",     f"{spec.road_width_m} m"),
-#         ("Default Separator",      f"{spec.separator_width_m} m"),
-#         ("Global Heading",         f"{spec.heading_override}° ({'manual' if spec.heading_override>=0 else 'auto'})"),
-#         ("Total Markers",          str(len(polygons))),
-#         ("Per-Marker Hdg Overrides", str(ov_count)),
-#         ("Per-Marker Lane Overrides", str(lc_count)),
-#         ("Total Strips Generated", str(sum(len(pg.strip_polygons) for pg in polygons))),
-#     ]
-#     for ri2, (lbl, val) in enumerate(rows, 2):
-#         fill = AF if ri2 % 2 == 0 else WF
-#         c1 = ws5.cell(row=ri2, column=1, value=lbl)
-#         c2 = ws5.cell(row=ri2, column=2, value=val)
-#         for c in [c1, c2]:
-#             c.fill = fill; c.border = T; c.alignment = LC
-#         c1.font = Font(bold=True, size=10)
-#         c2.font = Font(size=10)
-#     ws5.column_dimensions['A'].width = 32
-#     ws5.column_dimensions['B'].width = 52
-
-#     wb.save(out_path)
-
-
-# # ═══════════════════════════════════════════════════════════════════════════════
-# # PIPELINE
-# # ═══════════════════════════════════════════════════════════════════════════════
-
-# def run_pipeline(
-#     kml_in:               str,
-#     kml_out:              str,
-#     xlsx_out:             str,
-#     spec:                 PolygonSpec,
-#     per_marker_headings:  Dict[int, float]       = None,
-#     per_marker_overrides: Dict[int, MarkerOverride] = None,
-#     use_osm:              bool                   = True,
-#     progress_callback                            = None,
-# ) -> Tuple[List[MarkerInfo], List[GeneratedPolygon]]:
-
-#     from typing import Tuple
-#     per_marker_headings  = per_marker_headings  or {}
-#     per_marker_overrides = per_marker_overrides or {}
-
-#     markers = parse_kml_markers(kml_in)
-#     if not markers:
-#         raise ValueError("No point markers found in KML file.")
-
-#     pca_h    = pca_heading(markers)
-#     polygons = []
-
-#     for i, mk in enumerate(markers):
-#         if progress_callback:
-#             progress_callback(i, len(markers), mk.name)
-#         polygons.append(generate_polygon_for_marker(
-#             markers, i, spec, pca_h, use_osm,
-#             per_marker_headings, per_marker_overrides))
-
-#     export_kml(markers, polygons, kml_out, spec,
-#                per_marker_headings, per_marker_overrides)
-#     export_excel(polygons, xlsx_out, spec,
-#                  per_marker_headings, per_marker_overrides)
-#     return markers, polygons
-
-
-# from typing import Tuple
+"""
+p1.py v10 — Speed Breaker CAP PTBM Polygon Engine
+IIIT Nagpur | Under Dr. Neha Kasture | PWD / NHAI
+
+BUGS FIXED in v10:
+  ● BUG 1: road_heading from green line was +90° off
+      - Green line drawn ALONG road → bearing = road direction directly
+      - Green line drawn ACROSS road → bearing + 90° = road direction
+      - New UI option: "Line Direction" = Along / Across
+      - Along road (default): heading = GL_bearing  (road runs same way as line)
+      - Across road:          heading = GL_bearing + 90° + width = GL_length
+
+  ● BUG 2: GL matched to only 1 marker — now matches ALL within max_dist
+      - All markers within 50m of GL midpoint get the GL heading/width
+      - No marker left without heading when a nearby GL exists
+
+  ● BUG 3: GL length misused as road width when line is drawn along road
+      - Along-road lines: length = segment length, NOT road width → use manual width
+      - Across-road lines: length = road width → auto-fill
+
+  ● BUG 4: Bounding box was axis-aligned (always NSEW rectangle)
+      - Now uses rotated tight bounding box aligned to road heading
+      - No more huge red rectangles that don't match road angle
+"""
+from __future__ import annotations
+import math, xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+R_EARTH = 6_371_000.0
+
+LANE_PRESETS: Dict[str, dict] = {
+    "1-Lane (Town→Village)": dict(num_lanes=1, road_width_m=3.5,  separator_width_m=0.0),
+    "2-Lane (City→Town)":    dict(num_lanes=2, road_width_m=7.0,  separator_width_m=0.5),
+    "4-Lane (City→City)":    dict(num_lanes=4, road_width_m=14.0, separator_width_m=2.0),
+    "6-Lane (Highway)":      dict(num_lanes=6, road_width_m=21.0, separator_width_m=3.0),
+}
+
+MARKER_POSITION_LABELS: Dict[str, str] = {
+    "centre":     "Centre (default)",
+    "left_edge":  "Left Edge",
+    "left_lane":  "Left Lane Centre",
+    "right_lane": "Right Lane Centre",
+    "right_edge": "Right Edge",
+    "custom":     "Custom offset (m)",
+}
+
+LANE_COLOURS_KML = ["ff00d7ff","ff0088ff","ff00ff88","ffff44aa","ff44ffcc","ffcc44ff"]
+
+# GL line direction modes
+GL_MODE_ALONG  = "along"   # line drawn along the road  → bearing = road direction
+GL_MODE_ACROSS = "across"  # line drawn across the road → bearing+90 = road dir, length = width
+
+
+# ── geometry ───────────────────────────────────────────────────────
+def haversine(lat1:float,lon1:float,lat2:float,lon2:float)->float:
+    p1,p2=math.radians(lat1),math.radians(lat2)
+    dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
+    a=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*R_EARTH*math.asin(math.sqrt(max(0.0,min(1.0,a))))
+
+def forward_bearing(lat1:float,lon1:float,lat2:float,lon2:float)->float:
+    p1,p2=math.radians(lat1),math.radians(lat2)
+    dl=math.radians(lon2-lon1)
+    x=math.sin(dl)*math.cos(p2)
+    y=math.cos(p1)*math.sin(p2)-math.sin(p1)*math.cos(p2)*math.cos(dl)
+    return(math.degrees(math.atan2(x,y))+360)%360
+
+def norm180(h:float)->float:
+    h=h%360; return h-180 if h>=180 else h
+
+def offset_ll(lat:float,lon:float,bear:float,dist:float)->Tuple[float,float]:
+    d=dist/R_EARTH; b=math.radians(bear)
+    p1=math.radians(lat); l1=math.radians(lon)
+    p2=math.asin(math.sin(p1)*math.cos(d)+math.cos(p1)*math.sin(d)*math.cos(b))
+    l2=l1+math.atan2(math.sin(b)*math.sin(d)*math.cos(p1),
+                     math.cos(d)-math.sin(p1)*math.sin(p2))
+    return math.degrees(p2),math.degrees(l2)
+
+def build_strip(clat:float,clon:float,heading:float,along:float,
+                pnear:float,pfar:float,sw:float)->List[Tuple[float,float]]:
+    """Build one strip rectangle. Strips run PERPENDICULAR to road heading."""
+    pd=(heading+90)%360; hsw=sw/2; hlen=abs(pfar-pnear)/2; mp=(pnear+pfar)/2
+    cl,cn=offset_ll(clat,clon,heading,along)
+    sl,sn=offset_ll(cl,cn,pd,mp)
+    c=[]
+    for a in(+1,-1):
+        for p in(+1,-1):
+            la,lo=offset_ll(sl,sn,heading,a*hsw)
+            la,lo=offset_ll(la,lo,pd,p*hlen)
+            c.append((la,lo))
+    return[c[0],c[1],c[3],c[2],c[0]]
+
+
+def rotated_bbox(heading:float, polys:list) -> List[Tuple[float,float]]:
+    """
+    Compute tight bounding box ALIGNED to road heading.
+    Returns 5-point closed polygon in lat/lon.
+    FIX for BUG 4 — replaces axis-aligned bbox that gave huge wrong rectangles.
+    """
+    if not polys:
+        return []
+    # Use first polygon centre as reference origin
+    ref_lat = polys[0].coords[0][0]
+    ref_lon = polys[0].coords[0][1]
+    b_rad   = math.radians(heading)
+    perp_rad = math.radians((heading + 90) % 360)
+
+    # Project all coords onto (along-road, cross-road) axes
+    along_vals = []
+    cross_vals = []
+    all_coords = [c for p in polys for c in p.coords]
+    for lat, lon in all_coords:
+        dlat = math.radians(lat - ref_lat) * R_EARTH
+        dlon = math.radians(lon - ref_lon) * R_EARTH * math.cos(math.radians(ref_lat))
+        # along = projection onto road direction
+        a = dlat * math.cos(b_rad)   + dlon * math.sin(b_rad)
+        # cross = projection onto perpendicular
+        c = dlat * math.cos(perp_rad)+ dlon * math.sin(perp_rad)
+        along_vals.append(a); cross_vals.append(c)
+
+    a_min,a_max = min(along_vals)-0.05, max(along_vals)+0.05
+    c_min,c_max = min(cross_vals)-0.05, max(cross_vals)+0.05
+
+    # Convert 4 corners back to lat/lon
+    corners = []
+    for a, c in [(a_min,c_min),(a_min,c_max),(a_max,c_max),(a_max,c_min)]:
+        # Reconstruct lat/lon from (along, cross) offsets
+        # along direction: (cos(b), sin(b)) in (lat,lon) space
+        # cross direction: (cos(b+90), sin(b+90))
+        clat = ref_lat + math.degrees((a*math.cos(b_rad) + c*math.cos(perp_rad))/R_EARTH)
+        clon = ref_lon + math.degrees((a*math.sin(b_rad) + c*math.sin(perp_rad))
+                                      /(R_EARTH*math.cos(math.radians(ref_lat))))
+        corners.append((clat,clon))
+    corners.append(corners[0])
+    return corners
+
+
+# ── KML parse ──────────────────────────────────────────────────────
+@dataclass
+class KMLMarker:
+    name:str; lat:float; lon:float; index:int=0
+
+@dataclass
+class GreenLine:
+    name:str
+    start_lat:float; start_lon:float
+    end_lat:float;   end_lon:float
+    length_m:float
+    bearing_deg:float
+    # These two depend on gl_mode set at match time:
+    road_heading:float    # actual road direction (not always bearing+90)
+    gives_width:bool      # True if length_m = road width
+    midpoint_lat:float; midpoint_lon:float
+
+
+def parse_kml(path:str)->Tuple[List[KMLMarker],List[GreenLine]]:
+    """Parse KML — Point placemarks + LineString placemarks."""
+    root=ET.parse(path).getroot()
+    markers:List[KMLMarker]=[]; gls:List[GreenLine]=[]
+    def iter_pm(node):
+        for c in node:
+            if c.tag.split("}")[-1]=="Placemark": yield c
+            else: yield from iter_pm(c)
+    idx=0
+    for pm in iter_pm(root):
+        name=f"Marker_{idx+1}"
+        for c in pm:
+            if c.tag.split("}")[-1]=="name": name=(c.text or"").strip() or name; break
+        # Point
+        for el in pm.iter():
+            if el.tag.split("}")[-1]=="Point":
+                for ce in el.iter():
+                    if ce.tag.split("}")[-1]=="coordinates" and ce.text:
+                        p=ce.text.strip().split(",")
+                        if len(p)>=2:
+                            try:
+                                markers.append(KMLMarker(name,float(p[1]),float(p[0]),idx))
+                                idx+=1
+                            except ValueError: pass
+                break
+        # LineString
+        for el in pm.iter():
+            if el.tag.split("}")[-1]=="LineString":
+                for ce in el.iter():
+                    if ce.tag.split("}")[-1]=="coordinates" and ce.text:
+                        pts=ce.text.strip().split()
+                        if len(pts)>=2:
+                            try:
+                                p1=[float(v) for v in pts[0].split(",")]
+                                p2=[float(v) for v in pts[-1].split(",")]
+                                la1,lo1=p1[1],p1[0]; la2,lo2=p2[1],p2[0]
+                                d=haversine(la1,lo1,la2,lo2)
+                                b=forward_bearing(la1,lo1,la2,lo2)
+                                # road_heading and gives_width set later by match_gl
+                                gls.append(GreenLine(
+                                    name,la1,lo1,la2,lo2,
+                                    round(d,3),round(b,2),
+                                    road_heading=round(norm180(b),2),  # default: along
+                                    gives_width=False,
+                                    midpoint_lat=(la1+la2)/2,
+                                    midpoint_lon=(lo1+lo2)/2,
+                                ))
+                            except(ValueError,IndexError): pass
+                break
+    return markers,gls
+
+
+def match_gl(
+    markers:List[KMLMarker],
+    gls:List[GreenLine],
+    max_dist_m:float=50.0,
+    gl_mode:str=GL_MODE_ALONG,   # "along" or "across"
+) -> Dict[int, GreenLine]:
+    """
+    FIX BUG 1 + BUG 2 + BUG 3:
+
+    BUG 1 fix: road_heading depends on gl_mode
+      - along:  heading = norm180(GL_bearing)  ← line runs WITH the road
+      - across: heading = norm180(GL_bearing + 90) ← line runs ACROSS the road
+
+    BUG 2 fix: match GL to ALL markers within max_dist, not just nearest 1
+      - Every marker within 50m gets the GL heading assigned
+      - Closest marker also gets road_width if gl_mode=across
+
+    BUG 3 fix: only use GL length as road_width if gl_mode=across
+      - along mode: length = road segment length → don't use as width
+    """
+    # Update road_heading and gives_width on each GL based on mode
+    for gl in gls:
+        if gl_mode == GL_MODE_ACROSS:
+            gl.road_heading = round(norm180(gl.bearing_deg + 90), 2)
+            gl.gives_width  = True
+        else:  # along
+            gl.road_heading = round(norm180(gl.bearing_deg), 2)
+            gl.gives_width  = False
+
+    result: Dict[int, GreenLine] = {}
+
+    for gl in gls:
+        # Find ALL markers within max_dist of this GL's midpoint or endpoints
+        candidates = []
+        for mk in markers:
+            # Distance to midpoint
+            d_mid = haversine(gl.midpoint_lat, gl.midpoint_lon, mk.lat, mk.lon)
+            # Distance to start/end (in case marker is near an endpoint)
+            d_s   = haversine(gl.start_lat, gl.start_lon, mk.lat, mk.lon)
+            d_e   = haversine(gl.end_lat,   gl.end_lon,   mk.lat, mk.lon)
+            d_min = min(d_mid, d_s, d_e)
+            if d_min <= max_dist_m:
+                candidates.append((d_min, mk.index))
+
+        if not candidates:
+            continue
+
+        candidates.sort()  # closest first
+
+        for dist, mk_idx in candidates:
+            # For width: only the closest marker gets the GL's width
+            # All candidates get the heading
+            if mk_idx not in result:
+                result[mk_idx] = gl
+            else:
+                # Keep if this GL is closer
+                prev_gl = result[mk_idx]
+                prev_d  = haversine(prev_gl.midpoint_lat, prev_gl.midpoint_lon,
+                                    markers[mk_idx].lat, markers[mk_idx].lon)
+                if dist < prev_d:
+                    result[mk_idx] = gl
+
+    return result
+
+
+# ── heading detection ──────────────────────────────────────────────
+def road_heading(
+    markers:List[KMLMarker], idx:int,
+    gl:Optional[GreenLine]=None,
+    override:Optional[float]=None,
+    w:int=3,
+) -> Tuple[float,str]:
+    if override is not None: return norm180(override),"manual"
+    if gl is not None: return gl.road_heading,"green-line"
+    bs:List[Tuple[float,float]]=[]
+    if markers and 0<=idx<len(markers):
+        mk=markers[idx]
+        for off in range(-w,w+1):
+            if off==0: continue
+            j=idx+off
+            if j<0 or j>=len(markers): continue
+            nb=markers[j]; d=haversine(mk.lat,mk.lon,nb.lat,nb.lon)
+            if d<0.5: continue
+            b=norm180(forward_bearing(mk.lat,mk.lon,nb.lat,nb.lon))
+            bs.append((b,1.0/(abs(off)*max(d,1.0))))
+    if not bs: return 0.0,"default"
+    sx=sum(w2*math.cos(math.radians(2*b)) for b,w2 in bs)
+    sy=sum(w2*math.sin(math.radians(2*b)) for b,w2 in bs)
+    return norm180(math.degrees(math.atan2(sy,sx))/2),"neighbour"
+
+
+# ── spec ───────────────────────────────────────────────────────────
+@dataclass
+class MarkerOverride:
+    num_lanes:Optional[int]=None; road_width_m:Optional[float]=None
+    separator_width_m:Optional[float]=None; heading_deg:Optional[float]=None
+    lane_gap_m:Optional[float]=None; marker_position:str="centre"
+    custom_offset_m:float=0.0; strip_length_m:Optional[float]=None
+
+@dataclass
+class PolygonSpec:
+    strip_width_mm:float=15.0; num_strips:int=6; strip_gap_m:float=0.10
+    num_lanes:int=2; road_width_m:float=7.0; separator_width_m:float=0.5
+    lane_gap_m:float=-1.0; heading_override:Optional[float]=None
+    strip_length_m:Optional[float]=None
+    gl_mode:str=GL_MODE_ALONG        # "along" or "across"
+    marker_overrides:Dict[int,MarkerOverride]=field(default_factory=dict)
+    greenline_matches:Dict[int,GreenLine]=field(default_factory=dict)
+
+    def eff_sep(self,ov=None)->float:
+        return ov.separator_width_m if ov and ov.separator_width_m is not None else self.separator_width_m
+    def eff_lanes(self,ov=None)->int:
+        return ov.num_lanes if ov and ov.num_lanes is not None else self.num_lanes
+    def eff_rw(self,i:int)->float:
+        gl=self.greenline_matches.get(i)
+        # Only use GL length as width if it was drawn ACROSS the road
+        if gl and gl.gives_width: return gl.length_m
+        ov=self.marker_overrides.get(i)
+        if ov and ov.road_width_m is not None: return ov.road_width_m
+        return self.road_width_m
+    def eff_rw_src(self,i:int)->str:
+        gl=self.greenline_matches.get(i)
+        if gl and gl.gives_width: return "green-line (across)"
+        ov=self.marker_overrides.get(i)
+        if ov and ov.road_width_m is not None: return "manual"
+        return "global"
+    def eff_gap(self,lw:float,ov=None)->float:
+        lg=ov.lane_gap_m if ov and ov.lane_gap_m is not None else self.lane_gap_m
+        if lg and lg>0: return lg
+        return self.eff_sep(ov)+max(0.3,lw*0.10)
+    def eff_sl(self,lw:float,ov=None)->float:
+        sl=ov.strip_length_m if ov and ov.strip_length_m is not None else self.strip_length_m
+        return sl if sl is not None else lw
+
+
+# ── road centre ────────────────────────────────────────────────────
+def road_centre(lat,lon,heading,rw,ov,spec,idx)->Tuple[float,float]:
+    # If GL is across-road, its midpoint = road centre (accurate)
+    gl=spec.greenline_matches.get(idx)
+    if gl and gl.gives_width: return gl.midpoint_lat,gl.midpoint_lon
+    if ov is None or ov.marker_position=="centre": return lat,lon
+    nl=spec.eff_lanes(ov); sep=spec.eff_sep(ov); lw=(rw-sep)/max(nl,1)
+    perp=(heading+90)%360
+    offs={"left_edge":rw/2,"left_lane":lw/2,"right_lane":-lw/2,
+          "right_edge":-rw/2,"custom":ov.custom_offset_m}
+    sh=offs.get(ov.marker_position,0.0)
+    if sh==0.0: return lat,lon
+    return offset_ll(lat,lon,perp,sh)
+
+
+# ── polygon dataclass ──────────────────────────────────────────────
+@dataclass
+class GenPoly:
+    marker_idx:int; marker_name:str; lane_idx:int; strip_idx:int
+    global_idx:int; coords:List[Tuple[float,float]]
+    road_heading:float; heading_src:str
+    road_width_m:float; rw_src:str
+    lane_width_m:float; strip_width_m:float; strip_len_m:float
+    marker_pos:str; num_lanes:int
+
+
+# ── strip generator ────────────────────────────────────────────────
+def gen_marker(mk:KMLMarker,spec:PolygonSpec,heading:float,hsrc:str)->List[GenPoly]:
+    i=mk.index; ov=spec.marker_overrides.get(i)
+    rw=spec.eff_rw(i); rws=spec.eff_rw_src(i)
+    nl=spec.eff_lanes(ov); sep=spec.eff_sep(ov); lw=(rw-sep)/max(nl,1)
+    hg=spec.eff_gap(lw,ov)/2; sw=spec.strip_width_mm/1000
+    ns=spec.num_strips; gap=spec.strip_gap_m
+    clat,clon=road_centre(mk.lat,mk.lon,heading,rw,ov,spec,i)
+    spl=[ns//nl]*nl
+    for x in range(ns%nl): spl[x]+=1
+    hl=nl//2; res:List[GenPoly]=[]; gi=0
+    for li in range(nl):
+        n=spl[li]; sl=spec.eff_sl(lw,ov)
+        tier,sign=(hl-1-li,+1) if li<hl else (li-hl,-1)
+        inn=sign*(hg+tier*lw); out=sign*(hg+(tier+1)*lw)
+        ta=n*sw+(n-1)*gap; sa=-ta/2
+        for si in range(n):
+            ac=sa+si*(sw+gap)+sw/2
+            coords=build_strip(clat,clon,heading,ac,inn,out,sw)
+            res.append(GenPoly(i,mk.name,li,si,gi,coords,heading,hsrc,
+                rw,rws,lw,sw,sl,ov.marker_position if ov else "centre",nl))
+            gi+=1
+    return res
+
+
+# ── pipeline ───────────────────────────────────────────────────────
+def run_pipeline(
+    kml_path:str, spec:PolygonSpec,
+    per_headings:Optional[Dict[int,float]]=None,
+) -> Tuple[List[KMLMarker],List[GreenLine],Dict[int,GreenLine],List[GenPoly]]:
+    markers,gls=parse_kml(kml_path)
+    # Pass gl_mode to match_gl so headings and width flags are set correctly
+    glm=match_gl(markers,gls,max_dist_m=50.0,gl_mode=spec.gl_mode)
+    spec.greenline_matches=glm
+    all_p:List[GenPoly]=[]
+    for mk in markers:
+        i=mk.index; ov=spec.marker_overrides.get(i)
+        hov=None
+        if per_headings and i in per_headings: hov=per_headings[i]
+        elif ov and ov.heading_deg is not None: hov=ov.heading_deg
+        elif spec.heading_override is not None: hov=spec.heading_override
+        h,hs=road_heading(markers,i,glm.get(i),hov)
+        all_p.extend(gen_marker(mk,spec,h,hs))
+    return markers,gls,glm,all_p
+
+
+# ── KML export (with rotated bbox — BUG 4 fix) ────────────────────
+def export_kml(markers,all_p,spec,path):
+    ml=max((p.num_lanes for p in all_p),default=2)
+    by={}
+    for p in all_p: by.setdefault(p.marker_idx,[]).append(p)
+    def cs(coords): return" ".join(f"{lo:.8f},{la:.8f},0" for la,lo in coords)
+    def styles():
+        s=""
+        for i in range(max(ml,2)):
+            c=LANE_COLOURS_KML[i%len(LANE_COLOURS_KML)]
+            s+=(f'\n  <Style id="sL{i}"><LineStyle><color>{c}</color><width>3</width></LineStyle>'
+                f'<PolyStyle><color>{c}</color><fill>1</fill></PolyStyle></Style>')
+        s+=('\n  <Style id="bnd"><LineStyle><color>ff0000ff</color><width>1</width></LineStyle>'
+            '<PolyStyle><color>00000000</color><fill>0</fill></PolyStyle></Style>'
+            '\n  <Style id="pin"><IconStyle><scale>1.0</scale>'
+            '<Icon><href>http://maps.google.com/mapfiles/kml/pushpin/red-pushpin.png</href>'
+            '</Icon></IconStyle></Style>')
+        return s
+    L=['<?xml version="1.0" encoding="UTF-8"?>',
+       '<kml xmlns="http://www.opengis.net/kml/2.2">','<Document>',
+       '<n>CAP PTBM Speed Breaker Polygons — GIS BOQ Tool v10</n>',
+       styles()]
+    for mk in markers:
+        ps=by.get(mk.index,[])
+        L.append(f'<Folder><n>{mk.name}</n>')
+        L+=[f'<Placemark><n>{mk.name}</n><styleUrl>#pin</styleUrl>'
+            f'<Point><coordinates>{mk.lon:.8f},{mk.lat:.8f},0</coordinates></Point></Placemark>']
+        if ps:
+            p0=ps[0]
+            # BUG 4 FIX: rotated tight bounding box aligned to road heading
+            bbox=rotated_bbox(p0.road_heading,ps)
+            if bbox:
+                L+=[f'<Placemark><n>Boundary-{mk.name}</n>'
+                    f'<description>Road {p0.road_width_m:.2f}m [{p0.rw_src}] | '
+                    f'Heading {p0.road_heading:.1f}° [{p0.heading_src}] | '
+                    f'{len(ps)} strips</description>'
+                    f'<styleUrl>#bnd</styleUrl>'
+                    f'<Polygon><outerBoundaryIs><LinearRing>'
+                    f'<coordinates>{cs(bbox)}</coordinates>'
+                    f'</LinearRing></outerBoundaryIs></Polygon></Placemark>']
+            for p in ps:
+                L+=[f'<Placemark><n>S{p.global_idx+1} L{p.lane_idx+1}-{mk.name}</n>'
+                    f'<description>{p.strip_width_m*1000:.0f}mm | Lane {p.lane_idx+1} | '
+                    f'Road {p.road_width_m:.2f}m [{p.rw_src}] | '
+                    f'Heading {p.road_heading:.1f}°</description>'
+                    f'<styleUrl>#sL{p.lane_idx%max(p.num_lanes,1)}</styleUrl>'
+                    f'<Polygon><outerBoundaryIs><LinearRing>'
+                    f'<coordinates>{cs(p.coords)}</coordinates>'
+                    f'</LinearRing></outerBoundaryIs></Polygon></Placemark>']
+        L.append('</Folder>')
+    L+=["</Document>","</kml>"]
+    with open(path,"w",encoding="utf-8") as f: f.write("\n".join(L))
+
+
+# ── Excel export ───────────────────────────────────────────────────
+def _tb():
+    s=Side(style="thin"); return Border(left=s,right=s,top=s,bottom=s)
+def _fill(h): return PatternFill("solid",start_color=h,end_color=h)
+def _hdr(ws,r,c,v,bg="1F3864",fg="FFFFFF"):
+    x=ws.cell(r,c,v); x.font=Font(bold=True,color=fg,size=9)
+    x.fill=_fill(bg); x.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+    x.border=_tb(); return x
+def _dat(ws,r,c,v,bg=None,bold=False):
+    x=ws.cell(r,c,v); x.font=Font(bold=bold,size=9)
+    x.alignment=Alignment(horizontal="center",vertical="center")
+    x.border=_tb()
+    if bg: x.fill=_fill(bg)
+    return x
+
+def export_excel(markers,gls,glm,all_p,spec,path):
+    wb=openpyxl.Workbook()
+    # Sheet1 BOQ
+    ws1=wb.active; ws1.title="BOQ Summary"
+    H1=["S.No","Marker Name","Lat","Lon","Road Width (m)","Width Source",
+        "Heading (°)","Heading Src","GL Mode","Lanes","Lane Width (m)",
+        "Strips","Strip (mm)","Strip Length (m)","Area/Strip","Total Area","Notes"]
+    for ci,h in enumerate(H1,1): _hdr(ws1,1,ci,h)
+    ws1.row_dimensions[1].height=36
+    by={};
+    for p in all_p: by.setdefault(p.marker_idx,[]).append(p)
+    for ri,mk in enumerate(markers,2):
+        ps=by.get(mk.index,[]); bg="F2F7FF" if ri%2==0 else "FFFFFF"
+        p0=ps[0] if ps else None
+        rw=p0.road_width_m if p0 else spec.road_width_m
+        rws=p0.rw_src if p0 else "global"
+        sl=p0.strip_len_m if p0 else 0.0; area=(p0.strip_width_m*sl) if p0 else 0.0
+        gl=glm.get(mk.index)
+        gl_mode_lbl="Across" if (gl and gl.gives_width) else "Along" if gl else "—"
+        notes=("🟢 GL across (width auto)" if (gl and gl.gives_width)
+               else "🔵 GL along (heading only)" if gl
+               else "🔶 Manual" if rws=="manual" else "")
+        row=[ri-1,mk.name,round(mk.lat,6),round(mk.lon,6),
+             round(rw,3),rws,
+             round(p0.road_heading,1) if p0 else 0,
+             p0.heading_src if p0 else "—",
+             gl_mode_lbl,
+             p0.num_lanes if p0 else spec.num_lanes,
+             round(p0.lane_width_m,3) if p0 else 0,
+             len(ps),spec.strip_width_mm,round(sl,3),
+             round(area,4),round(area*len(ps),4),notes]
+        for ci,val in enumerate(row,1):
+            cbg=("FFD700" if ci==5 and gl and gl.gives_width
+                 else "E8F4FD" if ci==5 and gl and not gl.gives_width
+                 else "FFF3CD" if ci==5 and rws=="manual" else bg)
+            _dat(ws1,ri,ci,val,bg=cbg)
+    for i,w in enumerate([5,24,11,11,14,14,11,12,9,7,12,7,10,12,11,11,22],1):
+        ws1.column_dimensions[get_column_letter(i)].width=w
+
+    # Sheet2 — Road Measurements
+    ws2=wb.create_sheet("Road Measurements")
+    H2=["S.No","Line Name","Length (m)","Bearing (°)","Road Heading (°)",
+        "GL Mode","Gives Width?","Start Lat","Start Lon","End Lat","End Lon",
+        "Mid Lat","Mid Lon","Matched Markers","Status"]
+    for ci,h in enumerate(H2,1): _hdr(ws2,1,ci,h,bg="145A32")
+    ws2.row_dimensions[1].height=36
+    if not gls:
+        ws2.merge_cells("A2:O2")
+        c=ws2.cell(2,1,"No green lines found. Draw lines along/across road in Google Earth Pro → re-upload.")
+        c.font=Font(italic=True,color="C0392B",size=10)
+        c.alignment=Alignment(horizontal="center",vertical="center"); c.fill=_fill("FADBD8")
+        ws2.row_dimensions[2].height=30
+    else:
+        mk_idx_map={mk.index:mk for mk in markers}
+        for ri,gl in enumerate(gls,2):
+            matched=[mk_idx_map[mi].name for mi,g in glm.items() if id(g)==id(gl)]
+            ok=len(matched)>0; bg="E9F7EF" if ok else "FDECEA"
+            row2=[ri-1,gl.name,round(gl.length_m,3),round(gl.bearing_deg,2),
+                  round(gl.road_heading,2),
+                  "Across (width)" if gl.gives_width else "Along (heading)",
+                  "Yes" if gl.gives_width else "No",
+                  round(gl.start_lat,6),round(gl.start_lon,6),
+                  round(gl.end_lat,6),round(gl.end_lon,6),
+                  round(gl.midpoint_lat,6),round(gl.midpoint_lon,6),
+                  ", ".join(matched) if matched else "—",
+                  f"✅ {len(matched)} marker(s)" if ok else "⚠️ No match"]
+            for ci,val in enumerate(row2,1):
+                c=_dat(ws2,ri,ci,val,bg="FFD700" if ci==5 else bg)
+                if ci==5: c.font=Font(bold=True,size=10)
+    for i,w in enumerate([5,22,11,11,14,16,11,12,12,12,12,12,12,28,14],1):
+        ws2.column_dimensions[get_column_letter(i)].width=w
+
+    # Sheet3 Strip Coords
+    ws3=wb.create_sheet("Strip Coordinates")
+    H3=["S.No","Marker","Lane","Strip","C1 Lat","C1 Lon","C2 Lat","C2 Lon",
+        "C3 Lat","C3 Lon","C4 Lat","C4 Lon","Road Width","Source","Strip mm","Len m"]
+    for ci,h in enumerate(H3,1): _hdr(ws3,1,ci,h,bg="4A235A")
+    ws3.row_dimensions[1].height=36
+    for ri,p in enumerate(all_p,2):
+        bg="F5EEF8" if ri%2==0 else "FFFFFF"; cs_=p.coords[:4]
+        r3=[ri-1,p.marker_name,p.lane_idx+1,p.strip_idx+1,
+            *[round(v,8) for c_ in cs_ for v in c_],
+            round(p.road_width_m,3),p.rw_src,
+            round(p.strip_width_m*1000,1),round(p.strip_len_m,3)]
+        for ci,val in enumerate(r3,1): _dat(ws3,ri,ci,val,bg=bg)
+    for i,w in enumerate([5,22,7,8,12,12,12,12,12,12,12,12,11,14,9,9],1):
+        ws3.column_dimensions[get_column_letter(i)].width=w
+
+    # Sheet4 Spec
+    ws4=wb.create_sheet("Installation Spec")
+    _hdr(ws4,1,1,"Parameter",bg="784212"); _hdr(ws4,1,2,"Value",bg="784212")
+    ws4.column_dimensions["A"].width=30; ws4.column_dimensions["B"].width=65
+    rows=[("Tool","GIS BOQ Speed Breaker Tool v10"),
+          ("Institute","IIIT Nagpur — Dr. Neha Kasture"),("Client","PWD / NHAI"),("",""),
+          ("Strip Type","CAP PTBM (Capsule Prefab Thermoplastic Bituminous Marking)"),
+          ("Strip Width",f"{spec.strip_width_mm:.0f} mm"),
+          ("Total Strips",str(spec.num_strips)),("Strip Gap",f"{spec.strip_gap_m*100:.0f} cm"),
+          ("GL Mode",f"{'Across road (width from GL)' if spec.gl_mode==GL_MODE_ACROSS else 'Along road (heading from GL)'}"),
+          ("Default Road Width",f"{spec.road_width_m:.1f} m"),
+          ("Default Lanes",str(spec.num_lanes)),
+          ("Separator",f"{spec.separator_width_m:.2f} m"),("",""),
+          ("Total Markers",str(len(markers))),("Total Strips",str(len(all_p))),
+          ("Green Lines Found",str(len(gls))),("GL Matched",str(len(glm))),("",""),
+          ("Road Width Priority",
+           "1. GL across (length=width)  |  2. Manual  |  3. Global"),
+          ("Heading Priority",
+           "1. Manual override  |  2. GL along (bearing) or GL across (bearing+90°)  |  3. Neighbour avg")]
+    for ri,(k,v) in enumerate(rows,2):
+        ws4.cell(ri,1,k).font=Font(bold=bool(k),size=9)
+        ws4.cell(ri,2,v).font=Font(size=9)
+    wb.save(path)
+
+
+# ── self test ──────────────────────────────────────────────────────
+if __name__=="__main__":
+    import tempfile,os
+    # Use the actual KML from the user's file
+    KML="""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+    <Placemark><n>Untitled path</n>
+        <LineString><coordinates>
+            93.9456058575073,24.83222939738513,0 93.94549199991495,24.83219897227781,0
+        </coordinates></LineString>
+    </Placemark>
+    <Placemark><n>Untitled path 2</n>
+        <LineString><coordinates>
+            93.9456266349721,24.83217345898283,0 93.94572756213377,24.83219175047888,0
+        </coordinates></LineString>
+    </Placemark>
+    <Placemark><n>Untitled placemark</n>
+        <Point><coordinates>93.94549267755646,24.83219770964525,807</coordinates></Point>
+    </Placemark>
+    <Placemark><n>Untitled placemark</n>
+        <Point><coordinates>93.94560495041627,24.83222823099334,808</coordinates></Point>
+    </Placemark>
+    <Placemark><n>Untitled placemark</n>
+        <Point><coordinates>93.94562693818699,24.83217228694374,808</coordinates></Point>
+    </Placemark>
+    <Placemark><n>Untitled placemark</n>
+        <Point><coordinates>93.94572876485692,24.83219015575611,808</coordinates></Point>
+    </Placemark>
+</Document></kml>"""
+    with tempfile.NamedTemporaryFile(mode="w",suffix=".kml",delete=False) as f:
+        f.write(KML); kp=f.name
+
+    spec=PolygonSpec(
+        road_width_m=7.0, num_lanes=2, separator_width_m=0.5,
+        gl_mode=GL_MODE_ALONG,  # lines drawn ALONG road in this KML
+    )
+    m,g,glm,p=run_pipeline(kp,spec)
+    print(f"✅ Markers:{len(m)} GL:{len(g)} Matched:{len(glm)} Strips:{len(p)}")
+    print()
+    for gl in g:
+        print(f"  📏 {gl.name}: {gl.length_m:.2f}m  "
+              f"bearing={gl.bearing_deg:.1f}°  road_heading={gl.road_heading:.1f}°  "
+              f"gives_width={gl.gives_width}")
+    print()
+    for mk in m:
+        ps=[x for x in p if x.marker_idx==mk.index]
+        gl=glm.get(mk.index)
+        if ps:
+            print(f"  📍 {mk.name}: heading={ps[0].road_heading:.1f}° [{ps[0].heading_src}]  "
+                  f"width={ps[0].road_width_m:.2f}m [{ps[0].rw_src}]  strips={len(ps)}")
+    export_excel(m,g,glm,p,spec,"/tmp/p1_v10_test.xlsx")
+    export_kml(m,p,spec,"/tmp/p1_v10_test.kml")
+    print("\n✅ Excel + KML OK")
+    os.unlink(kp)

@@ -1,727 +1,585 @@
-# """
-# ui.py  v7  —  Speed Breaker GIS BOQ Tool
-# Per-marker heading + lane selector | Visual compass | Real-time preview
-# IIIT Nagpur | Dr. Neha Kasture | PWD / NHAI
-# Run:  streamlit run ui.py
-# """
-
-# import streamlit as st
-# import tempfile, time, math
-# import pandas as pd
-# import folium
-# from streamlit_folium import st_folium
-
-# from polygon import (
-#     parse_kml_markers, run_pipeline, pca_heading,
-#     PolygonSpec, MarkerOverride, GeneratedPolygon, MarkerInfo,
-#     haversine_distance, forward_bearing, normalise_heading,
-#     LANE_PRESETS,
-# )
-
-# # ── Page config ───────────────────────────────────────────────────────────────
-# st.set_page_config(
-#     page_title="GIS BOQ — Speed Breaker v7",
-#     page_icon="🚧", layout="wide",
-#     initial_sidebar_state="expanded",
-# )
-
-# # ── CSS ───────────────────────────────────────────────────────────────────────
-# st.markdown("""
-# <style>
-# @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-# html,body,[class*="css"]{font-family:'DM Sans',sans-serif;}
-
-# .banner{background:linear-gradient(135deg,#050d1a 0%,#0d1a2e 50%,#142340 100%);
-#   border:1px solid #FFD700;border-radius:16px;padding:22px 30px 16px;
-#   margin-bottom:20px;box-shadow:0 4px 28px rgba(255,215,0,.12);}
-# .banner h1{color:#FFD700;font-size:1.75rem;font-weight:700;margin:0 0 5px;}
-# .banner p{color:#94a3b8;font-size:.87rem;margin:0;}
-# .tag{display:inline-block;background:#1e3a5f;color:#60a5fa;border-radius:20px;
-#   padding:2px 10px;font-size:.7rem;font-weight:600;margin:5px 4px 0 0;}
-
-# .hdg-panel{background:#06111f;border:2px solid #FFD700;border-radius:12px;
-#   padding:14px 16px;margin-bottom:12px;}
-# .hdg-panel h4{color:#FFD700;margin:0 0 8px;font-size:.9rem;}
-
-# .stat{background:#0d1a2e;border:1px solid #1e3a5f;border-left:4px solid #FFD700;
-#   border-radius:9px;padding:11px 12px;text-align:center;}
-# .stat .v{font-size:1.55rem;font-weight:700;color:#FFD700;}
-# .stat .l{font-size:.65rem;color:#64748b;text-transform:uppercase;letter-spacing:1px;}
-
-# .mk-card{background:#0d1a2e;border:1px solid #1e3a5f;border-left:3px solid #2563eb;
-#   border-radius:8px;padding:10px 13px;margin-bottom:8px;}
-# .mk-card.has-hdg{border-left-color:#FF8C00;}
-# .mk-card.has-lane{border-left-color:#22c55e;}
-# .mk-card.has-both{border-left-color:#FF4444;}
-# .mk-card .title{color:#93c5fd;font-weight:600;font-size:.82rem;margin-bottom:4px;}
-# .mk-card.has-hdg .title{color:#FF8C00;}
-# .mk-card.has-lane .title{color:#22c55e;}
-# .mk-card.has-both .title{color:#FF4444;}
-# .mk-card .coords{color:#6b7280;font-family:'JetBrains Mono',monospace;font-size:.72rem;}
-
-# .compass-wrap{text-align:center;margin:8px 0 4px;}
-# .compass-label{font-size:.72rem;color:#94a3b8;text-align:center;margin-top:4px;}
-
-# .lane-btn{display:inline-block;padding:5px 12px;border-radius:8px;
-#   font-size:.78rem;font-weight:700;margin:3px;cursor:pointer;border:2px solid transparent;}
-# .lane-1{background:#1a3a1a;color:#4ade80;border-color:#166534;}
-# .lane-2{background:#1a2e4a;color:#60a5fa;border-color:#1e40af;}
-# .lane-4{background:#2e1a4a;color:#c084fc;border-color:#6b21a8;}
-# .lane-6{background:#3a1a1a;color:#f87171;border-color:#991b1b;}
-
-# .ok{background:#052e16;border:1px solid #16a34a;border-radius:7px;
-#   padding:8px 12px;color:#86efac;font-size:.8rem;margin:6px 0;}
-# .warn{background:#2d1400;border:1px solid #d97706;border-radius:7px;
-#   padding:8px 12px;color:#fde68a;font-size:.8rem;margin:6px 0;}
-# .info2{background:#06111f;border:1px dashed #1e3a5f;border-radius:7px;
-#   padding:8px 12px;color:#94a3b8;font-size:.79rem;margin:6px 0;}
-
-# div[data-testid="stSidebar"]{background:#050d1a;}
-# .stButton>button{background:linear-gradient(135deg,#d97706,#b45309);
-#   color:#fff;border:none;border-radius:8px;font-weight:600;transition:all .2s;}
-# .stButton>button:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(217,119,6,.4);}
-# </style>
-# """, unsafe_allow_html=True)
-
-# # ── Banner ────────────────────────────────────────────────────────────────────
-# st.markdown("""
-# <div class="banner">
-#   <h1>🚧 GIS BOQ Tool — CAP PTBM Speed Breaker v7</h1>
-#   <p>Per-marker lane + heading | Visual compass | Real-time preview | BOQ Excel</p>
-#   <span class="tag">IIIT Nagpur</span><span class="tag">Dr. Neha Kasture</span>
-#   <span class="tag">PWD/NHAI</span><span class="tag">v7 — Per-marker config</span>
-# </div>
-# """, unsafe_allow_html=True)
-
-
-# # ── Helper: SVG Compass ───────────────────────────────────────────────────────
-# def render_compass(road_hdg: float, size: int = 140) -> str:
-#     """
-#     Returns an SVG compass showing:
-#       🟡 Yellow solid line  = road direction (heading)
-#       🟠 Orange dashed line = strip direction (perpendicular)
-#     """
-#     cx, cy, r = size // 2, size // 2, size // 2 - 10
-#     r2 = r - 8
-
-#     road_rad  = math.radians(road_hdg)
-#     strip_rad = math.radians(road_hdg + 90)
-
-#     # Road line endpoints
-#     rx1 = cx + r2 * math.sin(road_rad);   ry1 = cy - r2 * math.cos(road_rad)
-#     rx2 = cx - r2 * math.sin(road_rad);   ry2 = cy + r2 * math.cos(road_rad)
-
-#     # Strip line endpoints
-#     sx1 = cx + r2 * math.sin(strip_rad);  sy1 = cy - r2 * math.cos(strip_rad)
-#     sx2 = cx - r2 * math.sin(strip_rad);  sy2 = cy + r2 * math.cos(strip_rad)
-
-#     strip_dir = int((road_hdg + 90) % 180)
-
-#     return f"""
-# <div class="compass-wrap">
-# <svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">
-#   <!-- Outer ring -->
-#   <circle cx="{cx}" cy="{cy}" r="{r}" fill="#06111f" stroke="#FFD700" stroke-width="2.5"/>
-#   <!-- Tick marks -->
-#   {''.join(
-#     f'<line x1="{cx+r*math.sin(math.radians(a)):.1f}" y1="{cy-r*math.cos(math.radians(a)):.1f}" '
-#     f'x2="{cx+(r-6)*math.sin(math.radians(a)):.1f}" y2="{cy-(r-6)*math.cos(math.radians(a)):.1f}" '
-#     f'stroke="#1e3a5f" stroke-width="1.5"/>'
-#     for a in range(0, 360, 30)
-#   )}
-#   <!-- Cardinal labels -->
-#   <text x="{cx}" y="14" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="DM Sans">N</text>
-#   <text x="{size-8}" y="{cy+4}" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="DM Sans">E</text>
-#   <text x="{cx}" y="{size-4}" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="DM Sans">S</text>
-#   <text x="8" y="{cy+4}" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="DM Sans">W</text>
-#   <!-- Strip direction (orange dashed) -->
-#   <line x1="{sx2:.1f}" y1="{sy2:.1f}" x2="{sx1:.1f}" y2="{sy1:.1f}"
-#         stroke="#FF8C00" stroke-width="2.5" stroke-dasharray="5 3" stroke-linecap="round"/>
-#   <!-- Road direction (yellow solid) -->
-#   <line x1="{rx2:.1f}" y1="{ry2:.1f}" x2="{rx1:.1f}" y2="{ry1:.1f}"
-#         stroke="#FFD700" stroke-width="3.5" stroke-linecap="round"/>
-#   <!-- Arrow head on road line -->
-#   <polygon points="{rx1:.1f},{ry1:.1f} {rx1-5*math.cos(road_rad)-4*math.sin(road_rad):.1f},{ry1+5*math.sin(road_rad)-4*math.cos(road_rad):.1f} {rx1-5*math.cos(road_rad)+4*math.sin(road_rad):.1f},{ry1+5*math.sin(road_rad)+4*math.cos(road_rad):.1f}"
-#            fill="#FFD700"/>
-#   <!-- Centre dot -->
-#   <circle cx="{cx}" cy="{cy}" r="4" fill="#FFD700"/>
-#   <!-- Heading text -->
-#   <text x="{cx}" y="{size-16}" text-anchor="middle" fill="#FFD700"
-#         font-size="11" font-weight="bold" font-family="DM Sans">{road_hdg:.0f}°</text>
-#   <!-- Legend -->
-#   <line x1="6" y1="{size-20}" x2="18" y2="{size-20}" stroke="#FFD700" stroke-width="3"/>
-#   <text x="21" y="{size-16}" fill="#FFD700" font-size="7" font-family="DM Sans">Road</text>
-#   <line x1="6" y1="{size-10}" x2="18" y2="{size-10}" stroke="#FF8C00" stroke-width="2"
-#         stroke-dasharray="4 2"/>
-#   <text x="21" y="{size-6}" fill="#FF8C00" font-size="7" font-family="DM Sans">Strip {strip_dir}°</text>
-# </svg>
-# </div>
-# <div class="compass-label">
-#   Road: <b style="color:#FFD700">{road_hdg:.0f}°</b> &nbsp;|&nbsp;
-#   Strip: <b style="color:#FF8C00">{strip_dir}°</b>
-# </div>
-# """
-
-
-# # ── Sidebar ───────────────────────────────────────────────────────────────────
-# with st.sidebar:
-
-#     # ── Global Heading ────────────────────────────────────────────────────────
-#     st.markdown("## 🧭 Global Road Heading")
-#     st.markdown('<div class="hdg-panel"><h4>Default angle for all straight markers</h4>',
-#                 unsafe_allow_html=True)
-
-#     use_manual = st.toggle("✏️ Set manually (recommended)", value=True)
-#     heading_val = 45
-#     if use_manual:
-#         heading_val = st.slider("Road Heading (°)", 0, 179, 45, 1,
-#                                  help="0=N–S | 45=NE–SW | 90=E–W | 135=SE–NW")
-#         st.markdown(render_compass(heading_val, size=140), unsafe_allow_html=True)
-#         heading_override = float(heading_val)
-#         st.markdown('</div>', unsafe_allow_html=True)
-#         st.markdown('<div class="ok">✅ Global heading active</div>', unsafe_allow_html=True)
-#     else:
-#         heading_override = -1.0
-#         use_osm = st.toggle("🌐 Try OSM road data", value=True)
-#         st.markdown('</div>', unsafe_allow_html=True)
-#         st.markdown('<div class="warn">⚠️ Auto-detect. Set manually if strips wrong angle.</div>',
-#                     unsafe_allow_html=True)
-
-#     st.markdown("---")
-
-#     # ── Default Road Config ───────────────────────────────────────────────────
-#     st.markdown("## 🛣️ Default Road Config")
-#     st.markdown("*(Used for markers without per-marker override)*")
-
-#     default_lanes = st.selectbox(
-#         "Default Lane Type",
-#         options=[1, 2, 4, 6],
-#         index=1,
-#         format_func=lambda x: LANE_PRESETS[x]["label"],
-#         help="Select the most common road type in your project"
-#     )
-#     preset = LANE_PRESETS[default_lanes]
-
-#     road_width_m  = st.number_input("Total Road Width (m)", 2.0, 60.0,
-#                                      float(preset["road_width"]), 0.5,
-#                                      help="Measure in Google Earth Pro: Tools → Ruler")
-#     has_sep       = st.toggle("Has Centre Separator", value=preset["has_sep"])
-#     sep_w         = 0.0
-#     if has_sep and default_lanes > 1:
-#         sep_w = st.number_input("Separator Width (m)", 0.0, 10.0,
-#                                  float(preset["separator"]), 0.25,
-#                                  help="Measure only the centre divider in Google Earth Pro")
-
-#     drv_lw_default = (road_width_m - (sep_w if has_sep and default_lanes > 1 else 0.0)) / default_lanes
-#     _auto_gap = round(sep_w + max(0.3, drv_lw_default * 0.10), 2) if has_sep and default_lanes > 1 else 0.0
-
-#     use_manual_gap = st.toggle("Override lane group gap", value=False)
-#     lane_gap_m = -1.0
-#     if use_manual_gap and default_lanes > 1:
-#         lane_gap_m = st.number_input("Lane Group Gap (m)", 0.1, road_width_m/2, _auto_gap, 0.25)
-#     elif default_lanes > 1:
-#         st.caption(f"↳ Auto gap = {_auto_gap:.2f}m (sep + clearance)")
-
-#     # Road cross-section visual
-#     if default_lanes > 1 and road_width_m > 0:
-#         tot = road_width_m
-#         sp  = sep_w if has_sep else 0
-#         lw  = (tot - sp) / default_lanes
-#         lanes_html = ""
-#         lane_colors = ["#FFD700","#FFA500","#00CC66","#9966FF"]
-#         for li in range(default_lanes):
-#             c = lane_colors[li % len(lane_colors)]
-#             ldir = "→" if li % 2 == 0 else "←"
-#             lanes_html += f'<div style="background:{c};flex:1;display:flex;align-items:center;justify-content:center;color:#000;font-size:.68rem;font-weight:700;">L{li+1}{ldir} {lw:.1f}m</div>'
-#         sep_html = (f'<div style="background:#4B5563;width:{max(12, int(sp/tot*120))}px;display:flex;'
-#                     f'align-items:center;justify-content:center;color:#9CA3AF;font-size:.6rem;">SEP</div>'
-#                     if has_sep and default_lanes > 1 else "")
-#         # For >2 lanes insert sep in middle
-#         half = default_lanes // 2
-#         lane_parts = lanes_html.split('</div>')
-#         left_lanes  = "".join(lane_parts[:half]) + ("</div>" if lane_parts[:half] else "")
-#         right_lanes = "".join(p + "</div>" for p in lane_parts[half:-1])
-#         st.markdown(f"""
-#         <div style="background:#06111f;border:1px solid #1e3a5f;border-radius:8px;padding:8px 10px;margin-top:6px;">
-#           <div style="font-size:.7rem;color:#94a3b8;margin-bottom:5px;">Cross-section preview:</div>
-#           <div style="display:flex;height:26px;border-radius:4px;overflow:hidden;">
-#             {left_lanes}{sep_html}{right_lanes}
-#           </div>
-#           <div style="font-size:.7rem;color:#60a5fa;margin-top:4px;">← {road_width_m:.1f}m total →</div>
-#         </div>
-#         """, unsafe_allow_html=True)
-
-#     st.markdown("---")
-
-#     # ── Strip Specification ───────────────────────────────────────────────────
-#     st.markdown("## 🟨 Strip Specification")
-#     strip_mm   = st.number_input("Strip Width (mm)", 5.0, 200.0, 15.0, 5.0,
-#                                   help="CAP PTBM thickness: 10mm or 15mm")
-#     num_strips = st.number_input("Total Strips (all lanes)", 1, 60, 6, 1)
-#     gap_m      = st.number_input("Gap Between Strips (m)", 0.01, 2.0, 0.10, 0.05)
-
-#     use_manual_len = st.toggle("Override strip length", value=False)
-#     strip_length_m = drv_lw_default
-#     if use_manual_len:
-#         strip_length_m = st.number_input("Strip Length (m)", 0.5, road_width_m, round(drv_lw_default, 1), 0.5)
-
-#     spl = int(num_strips) // int(default_lanes)
-#     area_one = (strip_mm / 1000.0) * strip_length_m
-#     st.info(
-#         f"**{int(num_strips)} ÷ {int(default_lanes)} = {spl}/lane**\n\n"
-#         f"`CAP PTBM {int(strip_mm)}MM X {int(num_strips)}`\n\n"
-#         f"Strip: **{strip_mm}mm × {strip_length_m:.2f}m** | Area: **{area_one:.4f} Sqm**"
-#     )
-
-
-# # ── Main columns ──────────────────────────────────────────────────────────────
-# cL, cR = st.columns([1.1, 1.7], gap="large")
-
-# # ── LEFT panel ───────────────────────────────────────────────────────────────
-# with cL:
-#     st.markdown("### 📂 Upload KML")
-#     uploaded = st.file_uploader("KML from Google Earth Pro", type=["kml"])
-
-#     if uploaded:
-#         st.success(f"✅ **{uploaded.name}** — {uploaded.size:,} bytes")
-#         with tempfile.NamedTemporaryFile(suffix=".kml", delete=False) as tmp:
-#             tmp.write(uploaded.read()); tmp_path = tmp.name
-#         try:
-#             markers = parse_kml_markers(tmp_path)
-#             st.session_state.update({"markers": markers, "tmp_kml": tmp_path})
-#             if "per_marker_headings" not in st.session_state:
-#                 st.session_state["per_marker_headings"] = {}
-#             if "per_marker_overrides" not in st.session_state:
-#                 st.session_state["per_marker_overrides"] = {}
-
-#             pca_h  = pca_heading(markers)
-#             spread = 0.0
-#             if len(markers) > 1:
-#                 spread = max(
-#                     haversine_distance(markers[i].lat, markers[i].lon,
-#                                        markers[j].lat, markers[j].lon)
-#                     for i in range(len(markers))
-#                     for j in range(i+1, min(i+3, len(markers)))
-#                 )
-#             st.markdown(f"**{len(markers)} markers** | spread ≈ {spread:.1f}m")
-#             if pca_h:
-#                 st.markdown(f'<div class="ok">🔵 PCA: <b>{pca_h:.1f}°</b></div>', unsafe_allow_html=True)
-#             elif spread < 5:
-#                 st.markdown('<div class="warn">⚠️ Markers close — use manual heading</div>', unsafe_allow_html=True)
-#         except Exception as e:
-#             st.error(f"KML error: {e}")
-
-#     # ── Per-Marker Config Table ───────────────────────────────────────────────
-#     if "markers" in st.session_state:
-#         markers    = st.session_state["markers"]
-#         pmh        = st.session_state.get("per_marker_headings", {})
-#         pmo_raw    = st.session_state.get("per_marker_overrides", {})
-
-#         st.markdown("---")
-#         st.markdown("### 🎯 Per-Marker Configuration")
-
-#         # Legend
-#         st.markdown("""
-#         <div class="info2">
-#         <b>🔵 Blue border</b> = default &nbsp;|&nbsp;
-#         <b>🟠 Orange</b> = heading override &nbsp;|&nbsp;
-#         <b>🟢 Green</b> = lane override &nbsp;|&nbsp;
-#         <b>🔴 Red</b> = both overridden
-#         </div>
-#         """, unsafe_allow_html=True)
-
-#         # Quick range tool
-#         with st.expander("⚡ Quick Range Assignment", expanded=False):
-#             rc1, rc2, rc3 = st.columns(3)
-#             with rc1:
-#                 r_from = st.number_input("From #", 1, len(markers), 1, 1, key="qrf")
-#             with rc2:
-#                 r_to   = st.number_input("To #",   1, len(markers), min(6, len(markers)), 1, key="qrt")
-#             with rc3:
-#                 r_hdg  = st.number_input("Heading°", 0, 179, int(heading_val), 1, key="qrh")
-#             r_lane = st.selectbox("Lane type for range", [None, 1, 2, 4, 6],
-#                                    format_func=lambda x: "— keep default —" if x is None
-#                                                          else LANE_PRESETS[x]["label"],
-#                                    key="qrl")
-#             qc1, qc2 = st.columns(2)
-#             with qc1:
-#                 if st.button("✅ Apply Range", use_container_width=True):
-#                     for mi in range(int(r_from), int(r_to)+1):
-#                         pmh[mi] = float(r_hdg)
-#                         if r_lane is not None:
-#                             preset_r = LANE_PRESETS[r_lane]
-#                             pmo_raw[mi] = MarkerOverride(
-#                                 num_lanes=r_lane,
-#                                 road_width_m=preset_r["road_width"],
-#                                 separator_width_m=preset_r["separator"],
-#                                 has_separator=preset_r["has_sep"],
-#                             )
-#                     st.session_state["per_marker_headings"]  = pmh
-#                     st.session_state["per_marker_overrides"] = pmo_raw
-#                     st.success(f"Applied M{int(r_from)}–{int(r_to)}: {r_hdg}°" +
-#                                (f" + {LANE_PRESETS[r_lane]['label']}" if r_lane else ""))
-#                     st.rerun()
-#             with qc2:
-#                 if st.button("🗑️ Clear Range", use_container_width=True):
-#                     for mi in range(int(r_from), int(r_to)+1):
-#                         pmh.pop(mi, None); pmo_raw.pop(mi, None)
-#                     st.session_state["per_marker_headings"]  = pmh
-#                     st.session_state["per_marker_overrides"] = pmo_raw
-#                     st.rerun()
-
-#         # Individual marker rows
-#         for mk in markers:
-#             has_h = mk.index in pmh
-#             has_l = mk.index in pmo_raw and pmo_raw[mk.index].num_lanes is not None
-#             card_cls = ("has-both" if has_h and has_l else
-#                         "has-hdg"  if has_h else
-#                         "has-lane" if has_l else "")
-#             cur_hdg  = pmh.get(mk.index, heading_val if use_manual else 45)
-#             cur_ov   = pmo_raw.get(mk.index)
-#             cur_lane = cur_ov.num_lanes if cur_ov and cur_ov.num_lanes else default_lanes
-
-#             icon = "🔴" if (has_h and has_l) else ("🟠" if has_h else ("🟢" if has_l else "🔵"))
-#             with st.expander(
-#                 f"{icon} M{mk.index}. {mk.name[:30]}"
-#                 f"{' | ' + str(cur_hdg) + '°' if has_h else ''}"
-#                 f"{' | ' + str(cur_lane) + '-lane' if has_l else ''}",
-#                 expanded=False
-#             ):
-#                 ec1, ec2 = st.columns([1.2, 1])
-
-#                 with ec1:
-#                     # Heading control
-#                     st.markdown("**Road Heading**")
-#                     new_hdg = st.slider(
-#                         f"Heading M{mk.index}",
-#                         0, 179, int(cur_hdg), 1,
-#                         key=f"hdg_{mk.index}",
-#                         label_visibility="collapsed",
-#                         help="Drag to set road heading for this marker"
-#                     )
-#                     # Lane selector
-#                     st.markdown("**Lane Type**")
-#                     new_lane = st.selectbox(
-#                         f"Lanes M{mk.index}",
-#                         options=[None, 1, 2, 4, 6],
-#                         index=([None, 1, 2, 4, 6].index(cur_lane)
-#                                if cur_lane in [None, 1, 2, 4, 6] else 0),
-#                         format_func=lambda x: "— use default —" if x is None
-#                                                else LANE_PRESETS[x]["label"],
-#                         key=f"lane_{mk.index}",
-#                         label_visibility="collapsed",
-#                     )
-#                     # Apply / clear buttons
-#                     bc1, bc2 = st.columns(2)
-#                     with bc1:
-#                         if st.button(f"📌 Set M{mk.index}", key=f"set_{mk.index}",
-#                                      use_container_width=True):
-#                             pmh[mk.index] = float(new_hdg)
-#                             if new_lane is not None:
-#                                 preset_m = LANE_PRESETS[new_lane]
-#                                 pmo_raw[mk.index] = MarkerOverride(
-#                                     num_lanes=new_lane,
-#                                     road_width_m=preset_m["road_width"],
-#                                     separator_width_m=preset_m["separator"],
-#                                     has_separator=preset_m["has_sep"],
-#                                 )
-#                             else:
-#                                 pmo_raw.pop(mk.index, None)
-#                             st.session_state["per_marker_headings"]  = pmh
-#                             st.session_state["per_marker_overrides"] = pmo_raw
-#                             st.rerun()
-#                     with bc2:
-#                         if st.button(f"✖ Clear", key=f"clr_{mk.index}",
-#                                      use_container_width=True):
-#                             pmh.pop(mk.index, None)
-#                             pmo_raw.pop(mk.index, None)
-#                             st.session_state["per_marker_headings"]  = pmh
-#                             st.session_state["per_marker_overrides"] = pmo_raw
-#                             st.rerun()
-
-#                 with ec2:
-#                     # Live compass for this marker
-#                     st.markdown(render_compass(new_hdg, size=130), unsafe_allow_html=True)
-#                     lane_lbl = LANE_PRESETS.get(new_lane or default_lanes, {}).get("label", "")
-#                     st.markdown(
-#                         f'<div style="text-align:center;font-size:.72rem;color:#94a3b8;">'
-#                         f'{lane_lbl}</div>',
-#                         unsafe_allow_html=True)
-#                     st.markdown(
-#                         f'<div class="coords" style="font-family:JetBrains Mono,monospace;'
-#                         f'font-size:.7rem;color:#6b7280;text-align:center;">'
-#                         f'{mk.lat:.5f}<br/>{mk.lon:.5f}</div>',
-#                         unsafe_allow_html=True)
-
-#         # Override summary
-#         if pmh or pmo_raw:
-#             st.markdown("---")
-#             all_keys = sorted(set(list(pmh.keys()) + list(pmo_raw.keys())))
-#             summary  = []
-#             for mi in all_keys:
-#                 mn = next((m.name[:20] for m in markers if m.index == mi), f"M{mi}")
-#                 ov = pmo_raw.get(mi)
-#                 summary.append({
-#                     "#": mi, "Name": mn,
-#                     "Heading": f"{pmh[mi]:.0f}°" if mi in pmh else "—",
-#                     "Lane": f"{ov.num_lanes}-lane" if ov and ov.num_lanes else "—",
-#                 })
-#             st.markdown(f"**{len(all_keys)} overrides active:**")
-#             st.dataframe(pd.DataFrame(summary), use_container_width=True,
-#                          hide_index=True, height=min(180, 40+36*len(summary)))
-#             if st.button("🗑️ Clear ALL overrides", use_container_width=True):
-#                 st.session_state["per_marker_headings"]  = {}
-#                 st.session_state["per_marker_overrides"] = {}
-#                 st.rerun()
-
-#     # ── Generate ──────────────────────────────────────────────────────────────
-#     st.markdown("---")
-#     st.markdown("### 🚀 Generate")
-#     gen = st.button("⚡ Generate Polygons & Export BOQ",
-#                     disabled=not uploaded, use_container_width=True)
-
-#     if gen and "tmp_kml" in st.session_state:
-#         pmh     = st.session_state.get("per_marker_headings", {})
-#         pmo_raw = st.session_state.get("per_marker_overrides", {})
-
-#         spec = PolygonSpec(
-#             strip_width_mm          = float(strip_mm),
-#             num_strips              = int(num_strips),
-#             gap_between_strips_m    = float(gap_m),
-#             strip_length_override_m = float(strip_length_m) if use_manual_len else -1.0,
-#             num_lanes               = int(default_lanes),
-#             road_width_m            = float(road_width_m),
-#             separator_width_m       = float(sep_w),
-#             has_separator           = bool(has_sep),
-#             lane_gap_m              = float(lane_gap_m) if use_manual_gap and default_lanes>1 else -1.0,
-#             heading_override        = float(heading_override),
-#         )
-
-#         pb = st.progress(0); txt = st.empty()
-#         def prog(i, tot, nm):
-#             pb.progress(int(i/tot*100)); txt.text(f"{i+1}/{tot}: {nm}")
-#         try:
-#             ko = st.session_state["tmp_kml"].replace(".kml","_out.kml")
-#             xo = st.session_state["tmp_kml"].replace(".kml","_out.xlsx")
-#             osm_flag = (not use_manual) and locals().get('use_osm', True)
-#             _, pols = run_pipeline(
-#                 st.session_state["tmp_kml"], ko, xo, spec,
-#                 per_marker_headings=pmh,
-#                 per_marker_overrides=pmo_raw,
-#                 use_osm=osm_flag,
-#                 progress_callback=prog,
-#             )
-#             pb.progress(100); time.sleep(0.3); pb.empty(); txt.empty()
-#             st.session_state.update({
-#                 "polygons": pols, "out_kml": ko, "out_excel": xo, "spec": spec})
-
-#             src_c = {}
-#             for pg in pols: src_c[pg.heading_source] = src_c.get(pg.heading_source, 0)+1
-#             ov_count = sum(1 for pg in pols if pg.heading_source == "per-marker")
-#             lc_count = sum(1 for pg in pols if pg.override and pg.override.num_lanes)
-#             st.success(f"✅ {len(pols)} markers × {spec.num_strips} strips = "
-#                        f"**{sum(len(p.strip_polygons) for p in pols)} polygons**")
-#             if ov_count or lc_count:
-#                 st.warning(f"🔶 {ov_count} heading overrides | 🟢 {lc_count} lane overrides")
-#             st.info("📡 " + " | ".join(f"{k}:{v}" for k,v in src_c.items()))
-#         except Exception as e:
-#             pb.empty(); txt.empty(); st.error(f"Error: {e}")
-#             import traceback; st.code(traceback.format_exc())
-
-#     if "out_kml" in st.session_state:
-#         st.markdown("---")
-#         st.markdown("### 📥 Download")
-#         with open(st.session_state["out_kml"],"rb") as f:
-#             st.download_button("⬇️ KML (Google Earth Pro)", f,
-#                                "speed_breaker_polygons.kml",
-#                                "application/vnd.google-earth.kml+xml",
-#                                use_container_width=True)
-#         with open(st.session_state["out_excel"],"rb") as f:
-#             st.download_button("⬇️ Excel BOQ Report", f,
-#                                "speed_breaker_BOQ.xlsx",
-#                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-#                                use_container_width=True)
-
-
-# # ── RIGHT panel: Map + Stats ──────────────────────────────────────────────────
-# with cR:
-#     st.markdown("### 🗺️ Satellite Preview")
-#     polygons = st.session_state.get("polygons")
-#     markers  = st.session_state.get("markers")
-#     spec     = st.session_state.get("spec")
-#     pmh_d    = st.session_state.get("per_marker_headings", {})
-
-#     if polygons and markers and spec:
-#         curv   = {"straight":0,"slight_curve":0,"sharp_curve":0}
-#         src_c  = {}
-#         ov_mks = []
-#         lc_mks = []
-#         for pg in polygons:
-#             curv[pg.road_curvature] = curv.get(pg.road_curvature,0)+1
-#             src_c[pg.heading_source] = src_c.get(pg.heading_source,0)+1
-#             if pg.heading_source=="per-marker": ov_mks.append(pg.marker.index)
-#             if pg.override and pg.override.num_lanes: lc_mks.append(pg.marker.index)
-
-#         # Stats
-#         cols = st.columns(5)
-#         for col,(v,l) in zip(cols,[
-#             (len(polygons),"Markers"),
-#             (spec.num_strips,"Strips/mkr"),
-#             (len(set(pg.num_lanes_used for pg in polygons)),"Lane types"),
-#             (len(ov_mks),"Hdg overrides"),
-#             (sum(len(pg.strip_polygons) for pg in polygons),"Total strips"),
-#         ]):
-#             with col:
-#                 st.markdown(f'<div class="stat"><div class="v">{v}</div>'
-#                             f'<div class="l">{l}</div></div>', unsafe_allow_html=True)
-
-#         # Source badges
-#         src_html = " ".join(
-#             f'<span style="background:#1e3a5f;color:#93c5fd;border-radius:10px;'
-#             f'padding:2px 8px;font-size:.73rem;font-weight:700;">{k}:{v}</span>'
-#             for k,v in src_c.items())
-#         st.markdown(f'<div style="margin:7px 0;font-size:.8rem;color:#94a3b8;">'
-#                     f'📡 Headings: {src_html}</div>', unsafe_allow_html=True)
-
-#         if ov_mks or lc_mks:
-#             parts = []
-#             if ov_mks: parts.append(f"🔶 Heading overrides: M{', M'.join(str(i) for i in sorted(ov_mks))}")
-#             if lc_mks: parts.append(f"🟢 Lane overrides: M{', M'.join(str(i) for i in sorted(lc_mks))}")
-#             st.markdown(f'<div class="warn">{" &nbsp;|&nbsp; ".join(parts)}</div>',
-#                         unsafe_allow_html=True)
-
-#         # Map
-#         avg_lat = sum(m.lat for m in markers)/len(markers)
-#         avg_lon = sum(m.lon for m in markers)/len(markers)
-#         fmap = folium.Map(
-#             location=[avg_lat, avg_lon], zoom_start=17,
-#             tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-#             attr="Google Satellite")
-#         folium.TileLayer("OpenStreetMap", name="Street").add_to(fmap)
-#         folium.LayerControl().add_to(fmap)
-
-#         LC = ["#FFD700","#FFA500","#00FF88","#AA00FF","#FF4444","#00CCFF"]
-
-#         for pg in polygons:
-#             mk = pg.marker
-#             is_hdg_ov  = pg.heading_source == "per-marker"
-#             is_lane_ov = pg.override and pg.override.num_lanes
-#             icon_color = ("red"    if is_hdg_ov and is_lane_ov else
-#                           "orange" if is_hdg_ov else
-#                           "green"  if is_lane_ov else
-#                           {"straight":"blue","slight_curve":"orange","sharp_curve":"red"}.get(pg.road_curvature,"blue"))
-
-#             lane_lbl = LANE_PRESETS.get(pg.num_lanes_used, {}).get("label", f"{pg.num_lanes_used}-Lane")
-#             popup = (
-#                 f"<b>M{mk.index}: {mk.name}</b><br/>"
-#                 f"{'🔶 HDG OVERRIDE<br/>' if is_hdg_ov else ''}"
-#                 f"{'🟢 LANE OVERRIDE<br/>' if is_lane_ov else ''}"
-#                 f"Heading: <b>{pg.heading_deg:.1f}°</b> [{pg.heading_source}]<br/>"
-#                 f"Lane type: <b>{lane_lbl}</b><br/>"
-#                 f"Curvature: {pg.road_curvature.replace('_',' ').title()}<br/>"
-#                 f"Strips: {len(pg.strip_polygons)}<br/>"
-#                 f"{mk.lat:.6f}, {mk.lon:.6f}"
-#             )
-#             folium.Marker(
-#                 [mk.lat, mk.lon],
-#                 popup=folium.Popup(popup, max_width=260),
-#                 tooltip=f"M{mk.index}: {pg.heading_deg:.0f}°[{pg.heading_source}] {pg.num_lanes_used}L",
-#                 icon=folium.Icon(
-#                     color=icon_color,
-#                     icon='exclamation-circle' if (is_hdg_ov or is_lane_ov) else 'road',
-#                     prefix='fa'),
-#             ).add_to(fmap)
-
-#             for strip, ln in zip(pg.strip_polygons, pg.lane_assignments):
-#                 ll = [[la, lo] for lo, la in strip]
-#                 c  = LC[(ln-1) % len(LC)]
-#                 folium.Polygon(
-#                     locations=ll, color=c, fill=True,
-#                     fill_color=c, fill_opacity=0.85, weight=1.5,
-#                     tooltip=f"M{mk.index} L{ln} {pg.heading_deg:.0f}° {pg.num_lanes_used}-lane",
-#                 ).add_to(fmap)
-
-#             if len(pg.coordinates) >= 3:
-#                 folium.Polygon(
-#                     locations=[[la,lo] for lo,la in pg.coordinates],
-#                     color="#FF4444", fill=False, weight=2, dash_array="5",
-#                 ).add_to(fmap)
-
-#         st_folium(fmap, width="100%", height=460, returned_objects=[])
-
-#         # Legend
-#         st.markdown("""
-#         <div style="display:flex;gap:10px;flex-wrap:wrap;font-size:.75rem;color:#94a3b8;margin:5px 0;">
-#           <span>🟡 Lane 1</span><span>🟠 Lane 2</span><span>🟢 Lane 3</span><span>🟣 Lane 4</span>
-#           <span>🔵 Default marker</span><span>🟠 Heading override</span>
-#           <span>🟢 Lane override</span><span>🔴 Both override</span>
-#         </div>
-#         """, unsafe_allow_html=True)
-
-#         # Detail table
-#         st.markdown("### 📋 Marker Summary")
-#         rows = []
-#         for pg in polygons:
-#             src_icon = {"per-marker":"🔶","global":"🟡","osm":"🟢",
-#                         "pca":"🔵","neighbour":"🔴"}.get(pg.heading_source,"⚪")
-#             lane_lbl = LANE_PRESETS.get(pg.num_lanes_used,{}).get("label","")
-#             rows.append({
-#                 "#":        pg.marker.index,
-#                 "Name":     pg.marker.name[:18],
-#                 "Hdg°":     f"{pg.heading_deg:.1f}",
-#                 "Src":      f"{src_icon} {pg.heading_source}",
-#                 "Lanes":    f"{pg.num_lanes_used} ({lane_lbl.split('(')[0].strip()})",
-#                 "Curv":     pg.road_curvature.replace("_"," "),
-#                 "Strips":   len(pg.strip_polygons),
-#                 "Override": ("Hdg+Lane" if (pg.heading_source=="per-marker" and pg.override and pg.override.num_lanes)
-#                               else "Hdg" if pg.heading_source=="per-marker"
-#                               else "Lane" if pg.override and pg.override.num_lanes
-#                               else "—"),
-#             })
-#         st.dataframe(pd.DataFrame(rows), use_container_width=True,
-#                      hide_index=True, height=min(400, 40+36*len(rows)))
-
-#     elif markers:
-#         avg_lat = sum(m.lat for m in markers)/len(markers)
-#         avg_lon = sum(m.lon for m in markers)/len(markers)
-#         pmh_cur = st.session_state.get("per_marker_headings",{})
-#         fmap = folium.Map(location=[avg_lat,avg_lon],zoom_start=16,tiles="OpenStreetMap")
-#         for mk in markers:
-#             has_ov = mk.index in pmh_cur
-#             folium.Marker([mk.lat,mk.lon],
-#                           tooltip=f"M{mk.index}: {mk.name}" + (f" [{pmh_cur[mk.index]:.0f}°]" if has_ov else ""),
-#                           icon=folium.Icon(color='orange' if not has_ov else 'red',icon='map-marker')).add_to(fmap)
-#         st_folium(fmap, width="100%", height=360, returned_objects=[])
-#         st.info("Set per-marker configs in left panel → Generate")
-
-#     else:
-#         st.markdown("""<div style="background:#0d1a2e;border-radius:12px;
-#             padding:50px 25px;text-align:center;border:1px dashed #1e3a5f;">
-#           <div style="font-size:3rem">🗺️</div>
-#           <div style="color:#64748b;margin-top:11px;font-size:.95rem">
-#             Upload KML to begin
-#           </div>
-#         </div>""", unsafe_allow_html=True)
-
-#         st.markdown("### 📖 Workflow")
-#         for n, d in [
-#             ("1","Export KML markers from Google Earth Pro"),
-#             ("2","Upload KML — all markers appear in left panel"),
-#             ("3","Set global heading via compass slider (sidebar)"),
-#             ("4","Expand each curve marker → set its individual heading via compass"),
-#             ("5","For mixed-road projects: set lane type per marker (1/2/4-lane)"),
-#             ("6","Use Quick Range to batch-assign straight section markers"),
-#             ("7","Click Generate → each marker gets its own correct angle + lane config"),
-#             ("8","Download KML (coloured by lane) + Excel BOQ (5 sheets)"),
-#         ]:
-#             st.markdown(
-#                 f'<div style="background:#0d1a2e;border-radius:7px;padding:9px 13px;'
-#                 f'margin-bottom:6px;border:1px solid #1e3a5f;">'
-#                 f'<span style="color:#FFD700;font-weight:700;margin-right:8px;">Step {n}</span>{d}</div>',
-#                 unsafe_allow_html=True)
-
-#         # Preview compass in empty state
-#         st.markdown("---")
-#         st.markdown("### 🧭 Compass Preview")
-#         demo_hdg = st.slider("Try the compass", 0, 179, 45, 1, key="demo_compass")
-#         st.markdown(render_compass(demo_hdg, size=160), unsafe_allow_html=True)
+"""
+ui1.py v10 — Speed Breaker GIS BOQ Tool
+IIIT Nagpur | Dr. Neha Kasture | PWD / NHAI
+Run: streamlit run ui1.py
+"""
+import streamlit as st
+import tempfile, os, math, time
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
+
+from p1 import (
+    PolygonSpec, MarkerOverride, GreenLine, KMLMarker, GenPoly,
+    run_pipeline, export_kml, export_excel,
+    LANE_PRESETS, MARKER_POSITION_LABELS,
+    haversine, norm180, GL_MODE_ALONG, GL_MODE_ACROSS,
+)
+
+# ── Page config ────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="GIS BOQ Tool · NHAI Speed Breaker",
+    page_icon="🚧",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── CSS ────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+html,body,[class*="css"]{font-family:'Space Grotesk',sans-serif;}
+#MainMenu,footer,header{visibility:hidden;}
+.block-container{padding-top:1.2rem!important;padding-bottom:2rem!important;}
+
+.hero{background:linear-gradient(135deg,#0f1923 0%,#1a2d42 50%,#0d2137 100%);
+  border-radius:16px;padding:26px 32px;margin-bottom:20px;
+  border:1px solid #1e3a52;position:relative;overflow:hidden;}
+.hero::before{content:'';position:absolute;top:-40px;right:-40px;
+  width:200px;height:200px;
+  background:radial-gradient(circle,rgba(255,215,0,.12) 0%,transparent 70%);border-radius:50%;}
+.hero-title{font-size:1.6rem;font-weight:700;color:#FFD700;margin:0 0 4px;}
+.hero-sub{font-size:.82rem;color:#8ba8c4;margin:0;}
+.hero-badges{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
+.hbadge{background:rgba(255,215,0,.12);color:#FFD700;
+  border:1px solid rgba(255,215,0,.3);padding:2px 10px;border-radius:20px;
+  font-size:.7rem;font-weight:600;font-family:'JetBrains Mono',monospace;}
+
+.sec-head{font-size:.68rem;font-weight:700;color:#FFD700;letter-spacing:1.5px;
+  text-transform:uppercase;margin:18px 0 8px;padding-bottom:5px;
+  border-bottom:1px solid #1e3a52;}
+
+/* GL mode card */
+.glmode-card{border-radius:10px;padding:12px 16px;margin:4px 0;cursor:pointer;}
+.glmode-along{background:#0a1a2e;border:2px solid #3498db;}
+.glmode-across{background:#0a1f14;border:2px solid #27ae60;}
+.glmode-title{font-size:.88rem;font-weight:700;margin-bottom:2px;}
+.glmode-along .glmode-title{color:#3498db;}
+.glmode-across .glmode-title{color:#27ae60;}
+.glmode-desc{font-size:.76rem;color:#8ba8c4;}
+
+.gl-card{background:#0a1f14;border:1px solid #1e5e35;border-left:4px solid #27ae60;
+  border-radius:10px;padding:12px 16px;margin:5px 0;}
+.gl-card-warn{background:#1f1800;border:1px solid #5e4a00;border-left:4px solid #f39c12;
+  border-radius:10px;padding:12px 16px;margin:5px 0;}
+.gl-none{background:#1f0a0a;border:1px solid #5e1e1e;border-left:4px solid #e74c3c;
+  border-radius:10px;padding:14px 18px;margin:5px 0;font-size:.86rem;color:#e8a0a0;}
+.gl-width{font-size:1.25rem;font-weight:700;color:#FFD700;
+  font-family:'JetBrains Mono',monospace;}
+.gl-name{font-size:.78rem;color:#8ba8c4;margin-bottom:2px;}
+
+.badge{font-size:.68rem;font-weight:700;padding:2px 8px;border-radius:12px;
+  font-family:'JetBrains Mono',monospace;}
+.badge-gl{background:#0a2e1a;color:#27ae60;border:1px solid #27ae60;}
+.badge-h{background:#2e1a00;color:#f39c12;border:1px solid #f39c12;}
+.badge-l{background:#001a2e;color:#3498db;border:1px solid #3498db;}
+
+section[data-testid="stSidebar"]{background:#0a1220!important;border-right:1px solid #1e3a52;}
+.stDownloadButton>button{
+  background:linear-gradient(135deg,#FFD700,#ffa500)!important;
+  color:#0f1923!important;font-weight:700!important;border:none!important;
+  border-radius:10px!important;padding:12px 24px!important;width:100%!important;
+  font-family:'Space Grotesk',sans-serif!important;}
+.stButton>button[kind="primary"]{
+  background:linear-gradient(135deg,#FFD700,#ffa500)!important;
+  color:#0f1923!important;font-weight:700!important;border:none!important;
+  border-radius:10px!important;width:100%!important;padding:12px!important;
+  font-size:1rem!important;margin-top:6px!important;}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Hero ───────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hero">
+  <p class="hero-title">🚧 GIS BOQ Automation Tool</p>
+  <p class="hero-sub">CAP PTBM Speed Breaker Strip Polygon Generator &nbsp;·&nbsp;
+     IIIT Nagpur &nbsp;·&nbsp; Dr. Neha Kasture &nbsp;·&nbsp; PWD / NHAI</p>
+  <div class="hero-badges">
+    <span class="hbadge">v10</span>
+    <span class="hbadge">GL Along/Across Fix</span>
+    <span class="hbadge">Multi-Marker GL Match</span>
+    <span class="hbadge">Rotated Bounding Box</span>
+    <span class="hbadge">Per-Marker Config</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── Compass SVG (FIXED — separate x/y variables, no subscript) ────
+def compass_svg(road_heading: float, size: int = 160) -> str:
+    cx = size // 2
+    cy = size // 2
+    r  = size // 2 - 12
+    rh   = float(road_heading) % 360
+    perp = (rh + 90) % 360
+
+    def ep(angle_deg: float, length: float):
+        a = math.radians(float(angle_deg) - 90)
+        return cx + length * math.cos(a), cy + length * math.sin(a)
+
+    rx1_x, rx1_y = ep(rh, r * 0.85)
+    rx2_x, rx2_y = ep((rh + 180) % 360, r * 0.85)
+    px1_x, px1_y = ep(perp, r * 0.82)
+    px2_x, px2_y = ep((perp + 180) % 360, r * 0.82)
+
+    cardinals = ""
+    for angle, lbl in [(0,"N"),(90,"E"),(180,"S"),(270,"W")]:
+        lx = cx + (r+9)*math.cos(math.radians(angle-90))
+        ly = cy + (r+9)*math.sin(math.radians(angle-90))
+        cardinals += (f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" '
+                      f'dominant-baseline="central" font-size="9" fill="#8ba8c4" '
+                      f'font-family="Space Grotesk,sans-serif">{lbl}</text>')
+
+    ticks = "".join(
+        f'<line x1="{cx+(r-5)*math.cos(math.radians(a-90)):.1f}" '
+        f'y1="{cy+(r-5)*math.sin(math.radians(a-90)):.1f}" '
+        f'x2="{cx+r*math.cos(math.radians(a-90)):.1f}" '
+        f'y2="{cy+r*math.sin(math.radians(a-90)):.1f}" '
+        f'stroke="#1e3a52" stroke-width="1.5"/>'
+        for a in range(0, 360, 10)
+    )
+    return f"""<svg width="{size}" height="{size}" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="{cx}" cy="{cy}" r="{r}" fill="#0a1220" stroke="#1e3a52" stroke-width="1.5"/>
+  {ticks}{cardinals}
+  <line x1="{rx1_x:.1f}" y1="{rx1_y:.1f}" x2="{rx2_x:.1f}" y2="{rx2_y:.1f}"
+        stroke="#FFD700" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="{px1_x:.1f}" y1="{px1_y:.1f}" x2="{px2_x:.1f}" y2="{px2_y:.1f}"
+        stroke="#e67e22" stroke-width="2.5" stroke-dasharray="6,4" stroke-linecap="round"/>
+  <circle cx="{cx}" cy="{cy}" r="4" fill="#FFD700"/>
+  <rect x="4" y="{size-26}" width="12" height="4" fill="#FFD700" rx="2"/>
+  <text x="19" y="{size-20}" font-size="8" fill="#8ba8c4"
+        font-family="JetBrains Mono,monospace">Road {rh:.0f}°</text>
+  <rect x="4" y="{size-14}" width="12" height="3" fill="none" stroke="#e67e22"
+        stroke-width="2" stroke-dasharray="4,2" rx="1"/>
+  <text x="19" y="{size-8}" font-size="8" fill="#8ba8c4"
+        font-family="JetBrains Mono,monospace">Strip {perp:.0f}°</text>
+</svg>"""
+
+
+# ── Session state ──────────────────────────────────────────────────
+for k, v in [("markers",[]),("greenlines",[]),("gl_matches",{}),
+              ("all_polygons",[]),("kml_bytes",None),("excel_bytes",None),
+              ("per_marker_h",{}),("per_marker_lanes",{}),("generated",False)]:
+    if k not in st.session_state: st.session_state[k] = v
+
+
+# ══════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown('<p class="sec-head">📂 KML Upload</p>', unsafe_allow_html=True)
+    uploaded = st.file_uploader(
+        "Upload KML from Google Earth Pro", type=["kml"],
+        label_visibility="collapsed",
+    )
+
+    # ── GL Mode (the key new control) ──────────────────────────
+    st.markdown('<p class="sec-head">📏 Green Line Direction</p>', unsafe_allow_html=True)
+    st.markdown("""
+<div class="glmode-card glmode-along">
+  <div class="glmode-title">↔ Along Road</div>
+  <div class="glmode-desc">Line drawn <b>parallel to road</b><br>
+  → Bearing = road heading<br>
+  → Length = segment (not width)<br>
+  → Road width from manual input</div>
+</div>
+<div class="glmode-card glmode-across" style="margin-top:6px">
+  <div class="glmode-title">↕ Across Road</div>
+  <div class="glmode-desc">Line drawn <b>perpendicular to road</b><br>
+  → Length = road width (auto-fill)<br>
+  → Bearing + 90° = road heading</div>
+</div>
+""", unsafe_allow_html=True)
+
+    gl_mode_choice = st.radio(
+        "How did you draw the green lines?",
+        options=["Along road (parallel)", "Across road (perpendicular)"],
+        index=0, key="glmode",
+    )
+    gl_mode = GL_MODE_ALONG if "Along" in gl_mode_choice else GL_MODE_ACROSS
+
+    if gl_mode == GL_MODE_ALONG:
+        st.info("📐 Road width will use manual input below", icon="ℹ️")
+    else:
+        st.success("📏 Road width auto-filled from line length", icon="✅")
+
+    with st.expander("How to draw lines in Google Earth Pro"):
+        if gl_mode == GL_MODE_ALONG:
+            st.markdown("""
+**Along road (current mode):**
+1. Add Path → draw line **along the road** from one end to another
+2. This gives road direction (heading) automatically
+3. Set road width manually in the Road Config section below
+            """)
+        else:
+            st.markdown("""
+**Across road (current mode):**
+1. Add Path → draw line **across the full road width** at each marker
+2. Line length = road width (auto-filled in Excel)
+3. Road heading = line bearing + 90°
+            """)
+
+    st.markdown('<p class="sec-head">🧭 Road Heading</p>', unsafe_allow_html=True)
+    use_global_h = st.toggle("Set manually (override GL)", False, key="ugh")
+    global_heading = 90.0
+    if use_global_h:
+        global_heading = float(st.slider("Heading °", 0, 179, 90, key="ghs"))
+        st.markdown(compass_svg(global_heading, 148), unsafe_allow_html=True)
+        st.caption(f"Road **{global_heading:.0f}°** → Strip **{(global_heading+90)%360:.0f}°**")
+    else:
+        st.caption("Auto from green lines / neighbouring markers")
+
+    st.markdown('<p class="sec-head">📍 Marker Position</p>', unsafe_allow_html=True)
+    default_pos = st.radio(
+        "Where is the pin placed on the road?",
+        options=list(MARKER_POSITION_LABELS.keys()),
+        format_func=lambda k: MARKER_POSITION_LABELS[k],
+        index=0, key="dpos",
+    )
+    custom_offset = 0.0
+    if default_pos == "custom":
+        custom_offset = st.number_input("Offset from road centre (m)", -20.0,20.0,0.0,0.1,key="co")
+
+    st.markdown('<p class="sec-head">🛣️ Road Configuration</p>', unsafe_allow_html=True)
+    lp_key = st.selectbox("Lane Type", list(LANE_PRESETS.keys()), index=1, key="lpk")
+    lp     = LANE_PRESETS[lp_key]
+    road_w = st.number_input("Total Road Width (m)", 2.0, 60.0, float(lp["road_width_m"]), 0.5, key="rw")
+    sep_w  = st.number_input("Separator Width (m)", 0.0, 10.0, float(lp["separator_width_m"]), 0.1, key="sep")
+    nl_def = int(lp["num_lanes"])
+    lw_auto = (road_w - sep_w) / max(nl_def, 1)
+    st.caption(f"↳ Each lane = **{lw_auto:.2f} m**")
+
+    use_lg = st.toggle("Override lane group gap", False, key="ulg")
+    lane_gap = -1.0
+    if use_lg:
+        ag = sep_w + max(0.3, lw_auto*0.10)
+        lane_gap = float(st.number_input("Lane group gap (m)", 0.1, 10.0, round(ag,2), 0.1, key="lg"))
+
+    st.markdown('<p class="sec-head">🟨 Strip Spec</p>', unsafe_allow_html=True)
+    sw_mm    = st.number_input("Strip Width (mm)", 5.0, 100.0, 15.0, 5.0, key="swmm")
+    n_strips = int(st.number_input("Total Strips (all lanes)", 1, 50, 6, 1, key="ns"))
+    s_gap    = st.number_input("Gap Between Strips (m)", 0.0, 1.0, 0.10, 0.01, key="sg")
+    st.caption(f"{n_strips} ÷ {nl_def} = **{n_strips//nl_def}/lane** | "
+               f"CAP PTBM {sw_mm:.0f}MM X {n_strips}")
+
+    use_sl = st.toggle("Override strip length", False, key="usl")
+    strip_len = None
+    if use_sl:
+        strip_len = float(st.number_input("Strip Length (m)", 0.5, 30.0,
+                                           round(lw_auto,2), 0.1, key="slen"))
+        if strip_len > lw_auto: st.warning(f"⚠️ {strip_len:.2f}m > lane {lw_auto:.2f}m")
+
+    st.markdown("---")
+    gen_btn = st.button("🔄 Generate Polygons", type="primary",
+                        disabled=uploaded is None, key="genb")
+    if not uploaded: st.caption("⬆️ Upload KML to enable")
+
+
+# ══════════════════════════════════════════════════════════════════
+# PARSE KML
+# ══════════════════════════════════════════════════════════════════
+markers_raw=[]; gl_raw=[]; kml_temp=""; n_markers=0
+
+if uploaded:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".kml") as tmp:
+        tmp.write(uploaded.getvalue()); kml_temp=tmp.name
+    try:
+        from p1 import parse_kml as _pk, match_gl as _mg
+        _m, _g = _pk(kml_temp)
+        _glm   = _mg(_m, _g, max_dist_m=50.0, gl_mode=gl_mode)
+        markers_raw=[{"name":m.name,"lat":m.lat,"lon":m.lon,"index":m.index} for m in _m]
+        gl_raw=_g; n_markers=len(markers_raw)
+
+        # Metrics
+        mc1,mc2,mc3,mc4 = st.columns(4)
+        mc1.metric("📍 Markers",      n_markers)
+        mc2.metric("📏 Green Lines",  len(_g),
+                   delta="headings auto-filled ✓" if _g else None)
+        mc3.metric("🟢 GL Matched",   len(_glm))
+        mc4.metric("Mode",
+                   "Along →" if gl_mode==GL_MODE_ALONG else "Across ↕",
+                   delta="heading only" if gl_mode==GL_MODE_ALONG else "width+heading")
+
+        # GL cards
+        if _g:
+            st.markdown('<p class="sec-head">📏 Green Line Analysis</p>',
+                        unsafe_allow_html=True)
+            # Show what each GL contributes
+            cols_gl = st.columns(min(len(_g), 3))
+            for i, gl in enumerate(_g):
+                matched_names=[m.name for m in _m
+                               if haversine(gl.midpoint_lat,gl.midpoint_lon,
+                                            m.lat,m.lon)<50]
+                card_cls = "gl-card" if matched_names else "gl-card-warn"
+                mode_lbl = "↔ Along → heading only" if gl_mode==GL_MODE_ALONG else "↕ Across → width + heading"
+                with cols_gl[i % len(cols_gl)]:
+                    if gl_mode == GL_MODE_ACROSS:
+                        width_str = f'<div class="gl-width">{gl.length_m:.2f} m</div>'
+                    else:
+                        width_str = f'<div style="font-size:.8rem;color:#8ba8c4;">Length: {gl.length_m:.2f}m (segment)</div>'
+                    st.markdown(
+                        f'<div class="{card_cls}">'
+                        f'<div class="gl-name">📏 {gl.name}</div>'
+                        f'{width_str}'
+                        f'<div style="font-size:.74rem;color:#8ba8c4;margin-top:4px">'
+                        f'Road heading: <b>{gl.road_heading:.1f}°</b><br>'
+                        f'{mode_lbl}<br>'
+                        f'{"✅ → " + ", ".join(matched_names) if matched_names else "⚠️ No marker within 50m"}'
+                        f'</div></div>',
+                        unsafe_allow_html=True,
+                    )
+        else:
+            if n_markers > 0:
+                st.markdown(
+                    '<div class="gl-none"><strong>No green lines found.</strong> '
+                    'Road heading will be auto-detected from marker neighbours. '
+                    'Draw lines in Google Earth Pro to improve accuracy.</div>',
+                    unsafe_allow_html=True,
+                )
+
+        if n_markers == 0:
+            st.error("❌ No Point markers found. Add red pins in Google Earth Pro and re-upload.")
+
+    except Exception as e:
+        st.error(f"❌ Parse error: {e}")
+        import traceback; st.code(traceback.format_exc())
+        n_markers=0
+
+else:
+    # Welcome
+    wc1, wc2 = st.columns([2,1])
+    with wc1:
+        st.markdown("""
+        <div style="background:#0a1220;border:1px dashed #1e3a52;border-radius:16px;
+                    padding:40px;text-align:center;margin-top:20px">
+          <div style="font-size:3rem;margin-bottom:16px">🗺️</div>
+          <div style="font-size:1.1rem;font-weight:600;color:#e8eaf0;margin-bottom:8px">
+            Upload a KML File to Begin</div>
+          <div style="font-size:.84rem;color:#8ba8c4;max-width:380px;margin:0 auto">
+            Export your Google Earth Pro markers as KML, upload here,
+            configure road settings, and generate yellow speed breaker polygons.
+          </div>
+        </div>""", unsafe_allow_html=True)
+    with wc2:
+        st.markdown("**Workflow**")
+        for s,t in [("1️⃣","Place red pins at each speed breaker location"),
+                    ("2️⃣","Draw green lines along OR across the road at each marker"),
+                    ("3️⃣","File → Save → Save Place As → KML"),
+                    ("4️⃣","Upload KML, set GL mode (Along/Across), configure, generate"),
+                    ("5️⃣","Download annotated KML + Excel BOQ report")]:
+            st.markdown(f"{s} {t}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# PER-MARKER CONFIG
+# ══════════════════════════════════════════════════════════════════
+if n_markers > 0:
+    st.markdown('<p class="sec-head">🎯 Per-Marker Configuration</p>',
+                unsafe_allow_html=True)
+
+    with st.expander("⚡ Quick Range Assignment"):
+        qc1,qc2,qc3,qc4 = st.columns(4)
+        r_from = int(qc1.number_input("From #",1,n_markers,1,1,key="qrf"))
+        r_to   = int(qc2.number_input("To #",r_from,n_markers,min(r_from+5,n_markers),1,key="qrt"))
+        r_hdg  = float(qc3.number_input("Heading °",0,179,90,1,key="qrh"))
+        if qc4.button("✅ Apply",key="qra"):
+            for i in range(r_from-1,r_to):
+                st.session_state.per_marker_h[i]=r_hdg
+            st.success(f"Markers {r_from}–{r_to} → {r_hdg}°")
+        if st.button("🗑️ Clear All Overrides",key="clr"):
+            st.session_state.per_marker_h={}; st.session_state.per_marker_lanes={}
+            st.rerun()
+
+    for mk in markers_raw:
+        i=mk["index"]; name=mk["name"]
+        h_ov=st.session_state.per_marker_h.get(i)
+        l_ov=st.session_state.per_marker_lanes.get(i)
+        gl_hit=any(haversine(gl.midpoint_lat,gl.midpoint_lon,mk["lat"],mk["lon"])<50
+                   for gl in gl_raw)
+
+        badges=""
+        if gl_hit: badges+=' <span class="badge badge-gl">📏GL</span>'
+        if h_ov is not None: badges+=' <span class="badge badge-h">H</span>'
+        if l_ov is not None: badges+=' <span class="badge badge-l">L</span>'
+
+        with st.expander(f"{i+1}. {name}", expanded=False):
+            if badges: st.markdown(badges, unsafe_allow_html=True)
+
+            if gl_hit:
+                mgl=next((gl for gl in gl_raw
+                           if haversine(gl.midpoint_lat,gl.midpoint_lon,
+                                        mk["lat"],mk["lon"])<50),None)
+                if mgl:
+                    if gl_mode==GL_MODE_ALONG:
+                        st.info(f"📏 GL matched → Road heading **{mgl.road_heading:.1f}°** "
+                                f"(line along road, bearing={mgl.bearing_deg:.1f}°). "
+                                f"Width = manual ({road_w:.1f}m).")
+                    else:
+                        st.success(f"📏 GL matched → Road width **{mgl.length_m:.2f}m** | "
+                                   f"Road heading **{mgl.road_heading:.1f}°** (bearing+90°)")
+
+            ec1,ec2=st.columns([3,2])
+            with ec1:
+                use_h=st.toggle("Manual heading",value=h_ov is not None,key=f"uh{i}")
+                if use_h:
+                    cur_h=float(h_ov if h_ov is not None else (global_heading if use_global_h else 90))
+                    new_h=float(st.slider(f"Heading #{i+1}",0,179,int(cur_h),1,key=f"hs{i}"))
+                    if st.button("📌 Set",key=f"seth{i}"):
+                        st.session_state.per_marker_h[i]=new_h; st.rerun()
+                    if h_ov is not None:
+                        st.caption(f"Active: **{h_ov:.0f}°**")
+                        if st.button("✖ Remove",key=f"rmh{i}"):
+                            del st.session_state.per_marker_h[i]; st.rerun()
+                elif h_ov is not None:
+                    del st.session_state.per_marker_h[i]
+
+                use_l=st.toggle("Manual lane type",value=l_ov is not None,key=f"ul{i}")
+                if use_l:
+                    cur_l=l_ov if l_ov in LANE_PRESETS else lp_key
+                    new_l=st.selectbox(f"Lane type #{i+1}",list(LANE_PRESETS.keys()),
+                                       index=list(LANE_PRESETS.keys()).index(cur_l),key=f"lps{i}")
+                    if st.button("📌 Set",key=f"setl{i}"):
+                        st.session_state.per_marker_lanes[i]=new_l; st.rerun()
+                    if l_ov is not None:
+                        st.caption(f"Active: **{l_ov}**")
+                        if st.button("✖ Remove",key=f"rml{i}"):
+                            del st.session_state.per_marker_lanes[i]; st.rerun()
+                elif l_ov is not None:
+                    del st.session_state.per_marker_lanes[i]
+
+            with ec2:
+                disp_h=float(st.session_state.per_marker_h.get(i)
+                              or (global_heading if use_global_h else 90.0))
+                st.markdown(compass_svg(disp_h,148),unsafe_allow_html=True)
+                st.caption(f"Road **{disp_h:.0f}°** | Strip **{(disp_h+90)%360:.0f}°**")
+
+
+# ══════════════════════════════════════════════════════════════════
+# GENERATE
+# ══════════════════════════════════════════════════════════════════
+if gen_btn and uploaded and n_markers>0:
+    spec=PolygonSpec(
+        strip_width_mm=float(sw_mm), num_strips=n_strips,
+        strip_gap_m=float(s_gap), num_lanes=nl_def,
+        road_width_m=float(road_w), separator_width_m=float(sep_w),
+        lane_gap_m=float(lane_gap),
+        heading_override=float(global_heading) if use_global_h else None,
+        strip_length_m=float(strip_len) if use_sl and strip_len else None,
+        gl_mode=gl_mode,
+    )
+    for mk in markers_raw:
+        i=mk["index"]
+        ov=MarkerOverride(marker_position=default_pos, custom_offset_m=float(custom_offset))
+        lp_ov=st.session_state.per_marker_lanes.get(i)
+        if lp_ov and lp_ov in LANE_PRESETS:
+            p2=LANE_PRESETS[lp_ov]
+            ov.num_lanes=p2["num_lanes"]; ov.road_width_m=p2["road_width_m"]
+            ov.separator_width_m=p2["separator_width_m"]
+        spec.marker_overrides[i]=ov
+
+    per_h=dict(st.session_state.per_marker_h)
+    prog=st.progress(0,"Parsing KML…")
+    try:
+        m_obj,g_obj,glm_obj,polys=run_pipeline(kml_temp,spec,per_h)
+        prog.progress(40,"Generating strips…")
+        out_kml =kml_temp.replace(".kml","_out.kml")
+        out_xlsx=kml_temp.replace(".kml","_out.xlsx")
+        export_kml(m_obj,polys,spec,out_kml)
+        prog.progress(70,"Exporting Excel…")
+        export_excel(m_obj,g_obj,glm_obj,polys,spec,out_xlsx)
+        prog.progress(90,"Building preview…")
+        with open(out_kml,"rb") as f: st.session_state.kml_bytes=f.read()
+        with open(out_xlsx,"rb") as f: st.session_state.excel_bytes=f.read()
+        st.session_state.markers=m_obj; st.session_state.greenlines=g_obj
+        st.session_state.gl_matches=glm_obj; st.session_state.all_polygons=polys
+        st.session_state.generated=True
+        prog.progress(100,"Done ✅"); time.sleep(0.3); prog.empty()
+        st.rerun()
+    except Exception as e:
+        prog.empty(); st.error(f"❌ Error: {e}")
+        import traceback; st.code(traceback.format_exc())
+
+
+# ══════════════════════════════════════════════════════════════════
+# RESULTS
+# ══════════════════════════════════════════════════════════════════
+if st.session_state.generated and st.session_state.all_polygons:
+    m_obj=st.session_state.markers; g_obj=st.session_state.greenlines
+    glm_obj=st.session_state.gl_matches; polys=st.session_state.all_polygons
+
+    st.markdown('<p class="sec-head">✅ Results</p>', unsafe_allow_html=True)
+    r1,r2,r3,r4,r5=st.columns(5)
+    r1.metric("📍 Markers",     len(m_obj))
+    r2.metric("🟨 Strips",      len(polys))
+    r3.metric("📏 Green Lines", len(g_obj))
+    r4.metric("🟢 Matched",     len(glm_obj))
+    r5.metric("Strips/Marker",  len(polys)//max(len(m_obj),1))
+
+    st.markdown('<p class="sec-head">📥 Downloads</p>', unsafe_allow_html=True)
+    dl1,dl2=st.columns(2)
+    if st.session_state.kml_bytes:
+        dl1.download_button("📥 Download KML — Google Earth Pro",
+            data=st.session_state.kml_bytes, file_name="speed_breakers.kml",
+            mime="application/vnd.google-earth.kml+xml",
+            use_container_width=True)
+    if st.session_state.excel_bytes:
+        dl2.download_button("📊 Download Excel BOQ Report",
+            data=st.session_state.excel_bytes, file_name="speed_breakers_boq.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
+
+    # Marker summary
+    st.markdown('<p class="sec-head">📋 Marker Summary</p>', unsafe_allow_html=True)
+    by={}
+    for p in polys: by.setdefault(p.marker_idx,[]).append(p)
+    rows=[]
+    for mk in m_obj:
+        ps=by.get(mk.index,[]); p0=ps[0] if ps else None
+        gl=glm_obj.get(mk.index)
+        rows.append({
+            "#": mk.index+1, "Marker": mk.name,
+            "Road Width (m)": round(p0.road_width_m,2) if p0 else "—",
+            "Width Src": p0.rw_src if p0 else "—",
+            "Heading °": round(p0.road_heading,1) if p0 else "—",
+            "Heading Src": p0.heading_src if p0 else "—",
+            "GL Mode": ("Across" if gl and gl.gives_width
+                        else "Along" if gl else "—"),
+            "Lanes": p0.num_lanes if p0 else "—",
+            "Strips": len(ps),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Folium map
+    st.markdown('<p class="sec-head">🗺️ Satellite Preview</p>', unsafe_allow_html=True)
+    if m_obj:
+        clat=sum(m.lat for m in m_obj)/len(m_obj)
+        clon=sum(m.lon for m in m_obj)/len(m_obj)
+        fmap=folium.Map(location=[clat,clon],zoom_start=19,
+            tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+            attr="Google Satellite")
+        COLS=["#FFD700","#FF8C00","#00FF88","#FF44AA","#44FFCC","#CC44FF"]
+        for p in polys:
+            folium.Polygon(
+                locations=[[la,lo] for la,lo in p.coords],
+                color=COLS[p.lane_idx%len(COLS)],fill=True,
+                fill_color=COLS[p.lane_idx%len(COLS)],fill_opacity=0.85,
+                weight=2,
+                tooltip=(f"{p.marker_name} | Lane {p.lane_idx+1} | "
+                         f"Strip {p.strip_idx+1} | {p.road_heading:.1f}° | "
+                         f"Width {p.road_width_m:.2f}m [{p.rw_src}]"),
+            ).add_to(fmap)
+        for mk in m_obj:
+            gl=glm_obj.get(mk.index)
+            gl_tip=(f"<br>📏 GL heading: <b>{gl.road_heading:.1f}°</b>"
+                    +(f"<br>Width: <b>{gl.length_m:.2f}m</b>" if gl and gl.gives_width else "")
+                    if gl else "")
+            folium.Marker([mk.lat,mk.lon],
+                popup=folium.Popup(f"<b>{mk.name}</b>{gl_tip}",max_width=220),
+                icon=folium.Icon(color="red",icon="map-marker",prefix="fa"),
+            ).add_to(fmap)
+        for gl in g_obj:
+            folium.PolyLine([[gl.start_lat,gl.start_lon],[gl.end_lat,gl.end_lon]],
+                color="#00cc44",weight=3,dash_array="8,4",
+                tooltip=f"GL: {gl.length_m:.2f}m | heading={gl.road_heading:.1f}°",
+            ).add_to(fmap)
+        st_folium(fmap,width="100%",height=520,returned_objects=[])
