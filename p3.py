@@ -2352,11 +2352,21 @@ def _dat(ws, r, c, v, bg=None):
     return x
 
 
+# def _render_worker(args):
+#     """Called by each thread — returns (mk_index, png_bytes or None)."""
+#     mk_index, snap_lat, snap_lon, ps, api_key = args
+#     img_b = capture_polygon_image_fast(snap_lat, snap_lon, ps, api_key, zoom=18)
+#     return mk_index, img_b
+
 def _render_worker(args):
     """Called by each thread — returns (mk_index, png_bytes or None)."""
     mk_index, snap_lat, snap_lon, ps, api_key = args
     img_b = capture_polygon_image_fast(snap_lat, snap_lon, ps, api_key, zoom=18)
     return mk_index, img_b
+
+
+
+
 
 def export_excel(markers: List[KMLMarker], all_polys: List[GenPoly],
                  headings: Dict, spec: PolySpec,
@@ -2503,34 +2513,36 @@ def export_excel(markers: List[KMLMarker], all_polys: List[GenPoly],
 
     _cb("Saving Excel…", 96)
     wb.save(out_path)
-
-
 # ─────────────────────────────────────────────────────────────────
 # Self-test
 # ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    TEST_KML = """<?xml version="1.0" encoding="UTF-8"?>
+    import sys
+    if any("streamlit" in arg for arg in sys.argv):
+        pass  # Don't run self-test when launched via Streamlit
+    else:
+        TEST_KML = """<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2"><Document>
   <Placemark><n>SB_1</n><Point><coordinates>93.94313688,24.83678499,0</coordinates></Point></Placemark>
   <Placemark><n>SB_2</n><Point><coordinates>93.94334266,24.83687056,0</coordinates></Point></Placemark>
 </Document></kml>"""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".kml", delete=False) as f:
-        f.write(TEST_KML); kp = f.name
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".kml", delete=False) as f:
+            f.write(TEST_KML); kp = f.name
 
-    api_key = ""
-    for env_p in [r"D:\Road_Safety_Reasearch_III\.env", ".env"]:
-        if os.path.exists(env_p):
-            for line in open(env_p):
-                if line.startswith("GOOGLE_API_KEY="):
-                    api_key = line.split("=", 1)[1].strip(); break
+        api_key = ""
+        for env_p in [r"D:\Road_Safety_Reasearch_III\.env", ".env"]:
+            if os.path.exists(env_p):
+                for line in open(env_p):
+                    if line.startswith("GOOGLE_API_KEY="):
+                        api_key = line.split("=", 1)[1].strip(); break
 
-    spec = PolySpec(road_width_m=7.0, num_lanes=2, num_strips=3,
-                    strip_thick_m=0.5, labels=["SLOW", "SPEED BREAKER"],
-                    rename_placemarks=True, api_key=api_key)
-    markers, polys, headings = run_pipeline(kp, spec)
-    print(f"✅ Markers:{len(markers)} Strips:{len(polys)}")
-    print(f"   LABEL_PRESETS keys: {list(LABEL_PRESETS.keys())}")
-    export_kml(markers, polys, headings, spec, "/tmp/p3_v5.kml")
-    export_excel(markers, polys, headings, spec, "/tmp/p3_v5.xlsx")
-    print("✅ KML + Excel → /tmp/p3_v5.*")
-    os.unlink(kp)
+        spec = PolySpec(road_width_m=7.0, num_lanes=2, num_strips=3,
+                        strip_thick_m=0.5, labels=["SLOW", "SPEED BREAKER"],
+                        rename_placemarks=True, api_key=api_key)
+        markers, polys, headings = run_pipeline(kp, spec)
+        print(f"✅ Markers:{len(markers)} Strips:{len(polys)}")
+        print(f"   LABEL_PRESETS keys: {list(LABEL_PRESETS.keys())}")
+        export_kml(markers, polys, headings, spec, "/tmp/p3_v5.kml")
+        export_excel(markers, polys, headings, spec, "/tmp/p3_v5.xlsx")
+        print("✅ KML + Excel → /tmp/p3_v5.*")
+        os.unlink(kp)
